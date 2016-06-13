@@ -73,6 +73,7 @@
 #include "hdlc_send.h"
 #include "gen_tone.h"
 #include "textcolor.h"
+#include "morse.h"
 
 
 static void usage (char **argv);
@@ -81,6 +82,8 @@ static int audio_file_close (void);
 
 static int g_add_noise = 0;
 static float g_noise_level = 0;
+static int g_morse_wpm = 0;		/* Send morse code at this speed. */
+
 
 static struct audio_s modem;
 
@@ -92,15 +95,22 @@ static void send_packet (char *str)
     	int flen;
 	int c;
 
-	pp = ax25_from_text (str, 1);
-	flen = ax25_pack (pp, fbuf);
-	for (c=0; c<modem.adev[0].num_channels; c++)
-	{
-	   hdlc_send_flags (c, 8, 0);
-	   hdlc_send_frame (c, fbuf, flen);
-	   hdlc_send_flags (c, 2, 1);
+
+	if (g_morse_wpm > 0) {
+
+	  morse_send (0, str, g_morse_wpm, 100, 100);
 	}
-	ax25_delete (pp);
+	else {
+	  pp = ax25_from_text (str, 1);
+	  flen = ax25_pack (pp, fbuf);
+	  for (c=0; c<modem.adev[0].num_channels; c++)
+	  {
+	    hdlc_send_flags (c, 8, 0);
+	    hdlc_send_frame (c, fbuf, flen);
+	    hdlc_send_flags (c, 2, 1);
+	  }
+	  ax25_delete (pp);
+	}
 }
 
 
@@ -108,7 +118,7 @@ static void send_packet (char *str)
 int main(int argc, char **argv)
 {
 	int c;
-	int digit_optind = 0;
+	//int digit_optind = 0;
 	int err;
 	int packet_count = 0;
 	int i;
@@ -146,14 +156,14 @@ int main(int argc, char **argv)
 	char output_file[256];		/* -o option */
 	FILE *input_fp = NULL;		/* File or NULL for built-in message */
 
-	strcpy (output_file, "");
+	strlcpy (output_file, "", sizeof(output_file));
 
 /*
  * Parse the command line options.
  */
 
 	while (1) {
-          int this_option_optind = optind ? optind : 1;
+          //int this_option_optind = optind ? optind : 1;
           int option_index = 0;
           static struct option long_options[] = {
             {"future1", 1, 0, 0},
@@ -164,7 +174,7 @@ int main(int argc, char **argv)
 
 	  /* ':' following option character means arg is required. */
 
-          c = getopt_long(argc, argv, "gm:s:a:b:B:r:n:o:z:82",
+          c = getopt_long(argc, argv, "gm:s:a:b:B:r:n:o:z:82M:",
                         long_options, &option_index);
           if (c == -1)
             break;
@@ -323,9 +333,23 @@ int main(int argc, char **argv)
 
             case 'o':				/* -o for Output file */
 
-              strcpy (output_file, optarg);
+              strlcpy (output_file, optarg, sizeof(output_file));
               text_color_set(DW_COLOR_INFO); 
               dw_printf ("Output file set to %s\n", output_file);
+              break;
+
+            case 'M':				/* -M for morse code speed */
+
+//TODO: document this.
+
+              g_morse_wpm = atoi(optarg);
+              text_color_set(DW_COLOR_INFO); 
+              dw_printf ("Morse code speed set to %d WPM.\n", g_morse_wpm);
+              if (g_morse_wpm < 5 || g_morse_wpm > 50) {
+                text_color_set(DW_COLOR_ERROR); 
+	        dw_printf ("Morse code speed must be in range of 5 to 50 WPM.\n");
+                exit (EXIT_FAILURE);
+              }
               break;
 
             case '?':
@@ -365,7 +389,11 @@ int main(int argc, char **argv)
         }
 
 
+
+
 	gen_tone_init (&modem, amplitude/2);
+	morse_init (&modem, amplitude/2);
+
 
         assert (modem.adev[0].bits_per_sample == 8 || modem.adev[0].bits_per_sample == 16);
         assert (modem.adev[0].num_channels == 1 || modem.adev[0].num_channels == 2);
@@ -441,12 +469,16 @@ int main(int argc, char **argv)
 	    if (modem.achan[0].modem_type == MODEM_SCRAMBLE) {
 	      g_noise_level = 0.33 * (amplitude / 200.0) * ((float)i / packet_count);
 	    }
+	    else if (modem.achan[0].baud < 600) {
+		/* About 2/3 should be decoded properly. */
+	      g_noise_level = amplitude *.0048 * ((float)i / packet_count);
+	    }
 	    else {
 		/* About 2/3 should be decoded properly. */
 	      g_noise_level = amplitude *.0023 * ((float)i / packet_count);
 	    }
 
-	    sprintf (stemp, "WB2OSZ-15>TEST:,The quick brown fox jumps over the lazy dog!  %04d of %04d", i, packet_count);
+	    snprintf (stemp, sizeof(stemp), "WB2OSZ-15>TEST:,The quick brown fox jumps over the lazy dog!  %04d of %04d", i, packet_count);
 
 	    send_packet (stemp);
 
@@ -658,6 +690,14 @@ static int audio_file_open (char *fname, struct audio_s *pa)
  *
  *----------------------------------------------------------------*/
 
+#define MY_RAND_MAX 0x7fffffff
+
+static int seed = 1;
+
+static int my_rand (void) {
+	seed = ((seed * 1103515245) + 12345) & MY_RAND_MAX;
+	return (seed);
+}
 
 int audio_put (int a, int c)
 {
@@ -680,8 +720,13 @@ int audio_put (int a, int c)
 
 /* Add random noise to the signal. */
 /* r should be in range of -1 .. +1. */
-	    
-	    r = (rand() - RAND_MAX/2.0) / (RAND_MAX/2.0);
+
+/* Use own function instead of rand() from the C library. */
+/* Windows and Linux have different results, messing up my self test procedure. */
+/* No idea what Mac OSX and BSD might do. */
+ 
+
+	    r = (my_rand() - MY_RAND_MAX/2.0) / (MY_RAND_MAX/2.0);
 
 	    s += 5 * r * g_noise_level * 32767;
 

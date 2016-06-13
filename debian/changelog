@@ -1,3 +1,9 @@
+direwolf (1.3-1compass1) wilderness; urgency=medium
+
+  *  Update to the upstream 1.3 sources.
+
+ --  Jeremy McDermond <nh6z@nh6z.net>  Mon, 13 Jun 2016 20:35:31 +0000
+
 direwolf (1.2-3) unstable; urgency=medium
 
   * Allow for building only architecture-independent packages (Closes: #806015)

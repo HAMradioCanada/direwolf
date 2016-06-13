@@ -1,7 +1,7 @@
 //
 //    This file is part of Dire Wolf, an amateur radio packet TNC.
 //
-//    Copyright (C) 2013, 2014  John Langner, WB2OSZ
+//    Copyright (C) 2013, 2014, 2015  John Langner, WB2OSZ
 //
 //    This program is free software: you can redistribute it and/or modify
 //    it under the terms of the GNU General Public License as published by
@@ -55,6 +55,11 @@
 #include "encode_aprs.h"
 #include "latlong.h"
 
+#include "server.h"
+#include "kiss.h"
+#include "kissnet.h"
+
+
 /* 
  * Information kept about local APRStt users.
  *
@@ -86,6 +91,10 @@ static struct tt_user_s {
 						/* Possibly other tactical call / object label. */
 						/* Null string indicates table position is not used. */
 
+	int count;				/* Number of times we received information for this object. */
+						/* Value 1 means first time and could be used to send */
+						/* a welcome greeting. */
+
 	int ssid;				/* SSID to add. */	
 						/* Default of 12 but not always. */			
 		
@@ -108,6 +117,7 @@ static struct tt_user_s {
 						/* 3 within 30 seconds to improve chances of */
 						/* being heard while using digipeater duplicate */
 						/* removal. */
+						// TODO:  I think implementation is different.
 
 	time_t next_xmit;			/* Time for next transmit.  Meaningful only */
 						/* if xmits > 0. */
@@ -116,23 +126,59 @@ static struct tt_user_s {
 						/* Otherwise, this is a display offset position */
 						/* from the gateway. */
 
+	char loc_text[24];			/* Text representation of location when a single */
+						/* lat/lon point would be deceptive.  e.g.  */
+						/* 32TPP8049 */
+						/* 32TPP8179549363 */
+						/* 32T 681795 4849363 */
+						/* EM29QE78 */
+
 	double latitude, longitude;		/* Location either from user or generated */		
 						/* position in the corral. */
 
+	int ambiguity;				/* Number of digits to omit from location. */
+						/* Default 0, max. 4. */
+
 	char freq[12];				/* Frequency in format 999.999MHz */
 
-	char comment[MAX_COMMENT_LEN+1];	/* Free form comment. */
+	char ctcss[5];				/* CTCSS tone.  Exactly 3 digits for integer part. */
+						/* For example 74.4 Hz becomes "074". */
+
+	char comment[MAX_COMMENT_LEN+1];	/* Free form comment from user. */
+						/* Comment sent in final object report includes */
+						/* other information besides this. */
 
 	char mic_e;				/* Position status. */
+						/* Should be a character in range of '1' to '9' for */
+						/* the predefined status strings or '0' for none. */
 
 	char dao[8];				/* Enhanced position information. */
+						
 
 } tt_user[MAX_TT_USERS];
 
 
 static void clear_user(int i);
 
-static void xmit_object_report (int i, double c_lat, double c_long, int ambiguity, double c_offs);
+static void xmit_object_report (int i, int first_time);
+
+static void tt_setenv (int i);
+
+
+#if __WIN32__
+
+// setenv is missing on Windows!
+
+int setenv(const char *name, const char *value, int overwrite)
+{
+	char etemp[1000];
+
+	snprintf (etemp, sizeof(etemp), "%s=%s", name, value);
+	putenv (etemp);
+	return (0);
+}
+
+#endif
 
 
 /*------------------------------------------------------------------
@@ -172,18 +218,19 @@ void tt_user_init (struct audio_s *p_audio_config, struct tt_config_s *p_tt_conf
 	}
 }
 
+
 /*------------------------------------------------------------------
  *
  * Name:        tt_user_search
  *
  * Purpose:     Search for user in recent history.
  *
- * Inputs:      callsign	- full or a suffix abbreviation
+ * Inputs:      callsign	- full or a old style 3 DIGIT suffix abbreviation
  *		overlay
  *
  * Returns:     Handle for refering to table position or -1 if not found.
  *		This happens to be an index into an array but
- *		the implementation could change so the caller should 
+ *		the implementation could change so the caller should
  *		not make any assumptions.
  *
  *----------------------------------------------------------------*/
@@ -230,6 +277,51 @@ int tt_user_search (char *callsign, char overlay)
 }  /* end tt_user_search */
 
 
+
+/*------------------------------------------------------------------
+ *
+ * Name:        tt_3char_suffix_search
+ *
+ * Purpose:     Search for new style 3 CHARACTER (vs. 3 digit) suffix in recent history.
+ *
+ * Inputs:      suffix	- full or a old style 3 DIGIT suffix abbreviation
+ *
+ * Outputs:	callsign - corresponding full callsign or empty string.
+ *
+ * Returns:     Handle for refering to table position (>= 0) or -1 if not found.
+ *		This happens to be an index into an array but
+ *		the implementation could change so the caller should
+ *		not make any assumptions.
+ *
+ *----------------------------------------------------------------*/
+
+int tt_3char_suffix_search (char *suffix, char *callsign)
+{
+	int i;
+
+
+/*
+ * Look for suffix in list of known calls.
+ */
+	for (i=0; i<MAX_TT_USERS; i++) {
+	  int len = strlen(tt_user[i].callsign);
+
+	  if (len >= 3 && len <= 6 && strcmp(tt_user[i].callsign + len - 3, suffix) == 0) {
+	    strlcpy (callsign, tt_user[i].callsign, MAX_CALLSIGN_LEN+1);
+	    return (i);
+	  }
+	}
+
+/*
+ * Not found.
+ */
+	strlcpy (callsign, "", MAX_CALLSIGN_LEN+1);
+	return (-1);
+
+}  /* end tt_3char_suffix_search */
+
+
+
 /*------------------------------------------------------------------
  *
  * Name:        clear_user
@@ -244,7 +336,7 @@ static void clear_user(int i)
 {
 	assert (i >= 0 && i < MAX_TT_USERS);
 
-	memset (&tt_user[i], 0, sizeof (struct tt_user_s));
+	memset (&(tt_user[i]), 0, sizeof (struct tt_user_s));
 
 } /* end clear_user */
 
@@ -341,7 +433,7 @@ static void digit_suffix (char *callsign, char *suffix)
 	char *t;
 
 
-	strcpy (suffix, "000");
+	strlcpy (suffix, "000", 5);			// TODO: should have proper size
 	tt_text_to_two_key (callsign, 0, two_key);
 	for (t = two_key; *t != '\0'; t++) {
 	  if (isdigit(*t)) {
@@ -365,9 +457,12 @@ static void digit_suffix (char *callsign, char *suffix)
  *		ssid
  *		overlay		- or symbol table identifier
  *		symbol
+ *		loc_text	- Original text for non lat/lon location
  *		latitude
  *		longitude
+ *		ambiguity
  *		freq
+ *		ctcss
  *		comment
  *		mic_e
  *		dao
@@ -380,11 +475,16 @@ static void digit_suffix (char *callsign, char *suffix)
  *
  *----------------------------------------------------------------*/
 
-int tt_user_heard (char *callsign, int ssid, char overlay, char symbol, double latitude, 
-		double longitude, char *freq, char *comment, char mic_e, char *dao)
+int tt_user_heard (char *callsign, int ssid, char overlay, char symbol, char *loc_text, double latitude, 
+		double longitude, int ambiguity, char *freq, char *ctcss, char *comment, char mic_e, char *dao)
 {
 	int i;
-	
+
+
+
+	//text_color_set(DW_COLOR_DEBUG);
+	//dw_printf ("tt_user_heard (%s, %d, %c, %c, %s, ...)\n", callsign, ssid, overlay, symbol, loc_text);
+
 /*
  * At this time all messages are expected to contain a callsign.
  * Other types of messages, not related to a particular person/object
@@ -392,7 +492,7 @@ int tt_user_heard (char *callsign, int ssid, char overlay, char symbol, double l
  */
 	if (callsign[0] == '\0') {
 	  text_color_set(DW_COLOR_ERROR);
-	  printf ("APRStt message did not include callsign.\n");
+	  printf ("APRStt tone sequence did not include callsign / object name.\n");
 	  return (TT_ERROR_NO_CALL);
 	}
 
@@ -408,12 +508,14 @@ int tt_user_heard (char *callsign, int ssid, char overlay, char symbol, double l
 	  i = find_avail ();
 
 	  assert (i >= 0 && i < MAX_TT_USERS);
-	  strncpy (tt_user[i].callsign, callsign, MAX_CALLSIGN_LEN);
-	  tt_user[i].callsign[MAX_CALLSIGN_LEN] = '\0';
+	  strlcpy (tt_user[i].callsign, callsign, sizeof(tt_user[i].callsign));
+	  tt_user[i].count = 1;
 	  tt_user[i].ssid = ssid;
 	  tt_user[i].overlay = overlay;
 	  tt_user[i].symbol = symbol;
 	  digit_suffix(tt_user[i].callsign, tt_user[i].digit_suffix);
+	  strlcpy (tt_user[i].loc_text, loc_text, sizeof(tt_user[i].loc_text));
+
 	  if (latitude != G_UNKNOWN && longitude != G_UNKNOWN) {
 	    /* We have specific location. */
 	    tt_user[i].corral_slot = 0;
@@ -425,19 +527,35 @@ int tt_user_heard (char *callsign, int ssid, char overlay, char symbol, double l
 	    tt_user[i].corral_slot = corral_slot();
 	  }
 
-	  strcpy (tt_user[i].freq, freq);
-	  strncpy (tt_user[i].comment, comment, MAX_COMMENT_LEN);
-	  tt_user[i].comment[MAX_COMMENT_LEN] = '\0';
+	  tt_user[i].ambiguity = ambiguity;
+
+	  strlcpy (tt_user[i].freq, freq, sizeof(tt_user[i].freq));
+	  strlcpy (tt_user[i].ctcss, ctcss, sizeof(tt_user[i].ctcss));
+	  strlcpy (tt_user[i].comment, comment, sizeof(tt_user[i].comment));
 	  tt_user[i].mic_e = mic_e;
-	  strncpy(tt_user[i].dao, dao, 6);
+	  strlcpy(tt_user[i].dao, dao, sizeof(tt_user[i].dao));
 	}
 	else {
 /*
  * Known user.  Update with any new information.
+ * Keep any old values where not being updated.
  */
 	  assert (i >= 0 && i < MAX_TT_USERS);
 
+	  tt_user[i].count++;
+
 	  /* Any reason to look at ssid here? */
+
+	  /* Update the symbol if not the default. */
+
+	  if (overlay != APRSTT_DEFAULT_SYMTAB || symbol != APRSTT_DEFAULT_SYMBOL) {
+	    tt_user[i].overlay = overlay;
+	    tt_user[i].symbol = symbol;
+	  }
+
+	  if (strlen(loc_text) > 0) {
+	    strlcpy (tt_user[i].loc_text, loc_text, sizeof(tt_user[i].loc_text));
+	  }
 
 	  if (latitude != G_UNKNOWN && longitude != G_UNKNOWN) {
 	    /* We have specific location. */
@@ -446,21 +564,29 @@ int tt_user_heard (char *callsign, int ssid, char overlay, char symbol, double l
 	    tt_user[i].longitude = longitude;
 	  }
 
+	  if (ambiguity != G_UNKNOWN) {
+	    tt_user[i].ambiguity = ambiguity;
+	  }
+
 	  if (freq[0] != '\0') {
-	    strcpy (tt_user[i].freq, freq);
+	    strlcpy (tt_user[i].freq, freq, sizeof(tt_user[i].freq));
+	  }
+
+	  if (ctcss[0] != '\0') {
+	    strlcpy (tt_user[i].ctcss, ctcss, sizeof(tt_user[i].ctcss));
 	  }
 
 	  if (comment[0] != '\0') {
-	    strncpy (tt_user[i].comment, comment, MAX_COMMENT_LEN);
+	    strlcpy (tt_user[i].comment, comment, MAX_COMMENT_LEN);
 	    tt_user[i].comment[MAX_COMMENT_LEN] = '\0';
 	  }
 
 	  if (mic_e != ' ') {
 	    tt_user[i].mic_e = mic_e;
 	  }
+
 	  if (strlen(dao) > 0) {
-	    strncpy(tt_user[i].dao, dao, 6);
-	    tt_user[i].dao[5] = '\0';
+	    strlcpy(tt_user[i].dao, dao, sizeof(tt_user[i].dao));
 	  }
 	}
 
@@ -470,6 +596,19 @@ int tt_user_heard (char *callsign, int ssid, char overlay, char symbol, double l
 	tt_user[i].last_heard = time(NULL);
 	tt_user[i].xmits = 0;
 	tt_user[i].next_xmit = tt_user[i].last_heard + save_tt_config_p->xmit_delay[0];
+
+/*
+ * Send to applications and IGate immediately.
+ */
+
+	xmit_object_report (i, 1);	
+
+/*
+ * Put properties into environment variables in preparation
+ * for calling a user-specified script.
+ */
+
+	tt_setenv (i);
 
 	return (0);	/* Success! */
 
@@ -497,12 +636,23 @@ void tt_user_background (void)
 	time_t now = time(NULL);
 	int i;
 
+	//text_color_set(DW_COLOR_DEBUG);
+	//dw_printf ("tt_user_background()  now = %d\n", (int)now);
+
+
 	for (i=0; i<MAX_TT_USERS; i++) {
+
+	  assert (i >= 0 && i < MAX_TT_USERS);
+
 	  if (tt_user[i].callsign[0] != '\0') {
 	    if (tt_user[i].xmits < save_tt_config_p->num_xmits && tt_user[i].next_xmit <= now) {
 
-	      xmit_object_report (i, save_tt_config_p->corral_lat, save_tt_config_p->corral_lon,
-			save_tt_config_p->corral_ambiguity, save_tt_config_p->corral_offset);	
+
+	      //text_color_set(DW_COLOR_DEBUG);
+	      //dw_printf ("tt_user_background()  now = %d\n", (int)now);
+	      //tt_user_dump ();
+
+	      xmit_object_report (i, 0);	
  
 	      /* Increase count of number times this one was sent. */
 	      tt_user[i].xmits++;
@@ -510,6 +660,8 @@ void tt_user_background (void)
 	        /* Schedule next one. */
 	        tt_user[i].next_xmit += save_tt_config_p->xmit_delay[tt_user[i].xmits];    
 	      }
+
+	      //tt_user_dump ();
 	    }
 	  }
 	}
@@ -521,7 +673,7 @@ void tt_user_background (void)
 	  if (tt_user[i].callsign[0] != '\0') {
 	    if (tt_user[i].last_heard + save_tt_config_p->retain_time < now) {
 
-		 // debug - dw_printf ("debug: purging expired user %d\n", i);
+	     //dw_printf ("debug: purging expired user %d\n", i);
 
 	      clear_user (i);
 	    }
@@ -536,11 +688,13 @@ void tt_user_background (void)
  *
  * Purpose:     Create object report packet and put into transmit queue.
  *
- * Inputs:      i	- Index into user table.
- *		c_lat	- Corral latitude.
- *		c_long	- Corral longitude.
- *		ambiguity - Number of amibiguity digits: 0, 1, 2, or 3.
- *		c_offs	- Corral (latitude) offset.
+ * Inputs:      i	   - Index into user table.
+ *
+ *		first_time - Is this being called immediately after the tone sequence
+ *			 	was received or after some delay?
+ *				For the former, we send to any attached applications
+ *				and the IGate.
+ *				For the latter, we transmit over radio.
  *
  * Outputs:	Append to transmit queue.
  *
@@ -561,30 +715,21 @@ void tt_user_background (void)
  *
  *----------------------------------------------------------------*/
 
-static const char *mic_e_position_comment[10] = {
-	"",
-	"/off duty  ",
-	"/enroute   ",
-	"/in service",
-	"/returning ",
-	"/committed ",
-	"/special   ",
-	"/priority  ",
-	"/emergency ",
-	"/custom 1  " };
-
-static void xmit_object_report (int i, double c_lat, double c_long, int ambiguity, double c_offs)
+static void xmit_object_report (int i, int first_time)
 {
-	char object_name[20];
-	char object_info[50];
-	char info_comment[100];
+	char object_name[20];		// xxxxxxxxx or xxxxxx-nn
+	char info_comment[200];		// usercomment [locationtext] /status !DAO!
+	char object_info[250];		// info part of Object Report packet
+	char stemp[300];		// src>dest,path:object_info
+
 	double olat, olong;
-	char stemp[200];
+	int oambig;			// Position ambiguity.
 	packet_t pp;
-	unsigned char fbuf[AX25_MAX_PACKET_LEN];
-	int flen;
 	char c4[4];
 
+	//text_color_set(DW_COLOR_DEBUG);
+	//printf ("xmit_object_report (index = %d, first_time = %d) rx = %d, tx = %d\n", i, first_time, 
+	//			save_tt_config_p->obj_recv_chan, save_tt_config_p->obj_xmit_chan);
 
 	assert (i >= 0 && i < MAX_TT_USERS);
 
@@ -592,12 +737,12 @@ static void xmit_object_report (int i, double c_lat, double c_long, int ambiguit
  * Prepare the object name.  
  * Tack on "-12" if it is a callsign.
  */
-	strcpy (object_name, tt_user[i].callsign);
+	strlcpy (object_name, tt_user[i].callsign, sizeof(object_name));
 
 	if (strlen(object_name) <= 6 && tt_user[i].ssid != 0) {
 	  char stemp8[8];
-	  sprintf (stemp8, "-%d", tt_user[i].ssid);
-	  strcat (object_name, stemp8);
+	  snprintf (stemp8, sizeof(stemp8), "-%d", tt_user[i].ssid);
+	  strlcat (object_name, stemp8, sizeof(object_name));
 	}
 
 	if (tt_user[i].corral_slot == 0) {
@@ -606,66 +751,104 @@ static void xmit_object_report (int i, double c_lat, double c_long, int ambiguit
  */
 	  olat = tt_user[i].latitude;
 	  olong = tt_user[i].longitude;
+	  oambig = tt_user[i].ambiguity;
+	  if (oambig == G_UNKNOWN) oambig = 0;
 	}
 	else {
 /*
  * Use made up position in the corral.
  */
+	  double c_lat = save_tt_config_p->corral_lat;		// Corral latitude.
+	  double c_long = save_tt_config_p->corral_lon;		// Corral longitude.
+	  double c_offs =  save_tt_config_p->corral_offset;	// Corral (latitude) offset.
+
 	  olat = c_lat - (tt_user[i].corral_slot - 1) * c_offs;
 	  olong = c_long;
+	  oambig = 0;
 	}
 
 /*
  * Build comment field from various information.
+ *
+ * 	usercomment [locationtext] /status !DAO!
+ *
+ * Any frequency is inserted at beginning later.
  */
-	strcpy (info_comment, "");
+	strlcpy (info_comment, "", sizeof(info_comment));
 
 	if (strlen(tt_user[i].comment) != 0) {
-	  strcat (info_comment, tt_user[i].comment);
+	  strlcat (info_comment, tt_user[i].comment, sizeof(info_comment));
 	}
+
+	if (strlen(tt_user[i].loc_text) > 0) {
+	  if (strlen(info_comment) > 0) {
+	    strlcat (info_comment, " ", sizeof(info_comment));
+	  }
+	  strlcat (info_comment, "[", sizeof(info_comment));
+	  strlcat (info_comment, tt_user[i].loc_text, sizeof(info_comment));
+	  strlcat (info_comment, "]", sizeof(info_comment));
+	}
+
 	if (tt_user[i].mic_e >= '1' && tt_user[i].mic_e <= '9') {
-	  strcat (info_comment, mic_e_position_comment[tt_user[i].mic_e - '0']);
+	  
+	  if (strlen(info_comment) > 0) {
+	    strlcat (info_comment, " ", sizeof(info_comment));
+	  }
+
+	  // Insert "/" if status does not already begin with it.
+	  if (save_tt_config_p->status[tt_user[i].mic_e - '0'][0] != '/') {
+	    strlcat (info_comment, "/", sizeof(info_comment));
+	  }
+	  strlcat (info_comment, save_tt_config_p->status[tt_user[i].mic_e - '0'], sizeof(info_comment));
 	}
+
 	if (strlen(tt_user[i].dao) > 0) {
-	  strcat (info_comment, tt_user[i].dao);
+	  if (strlen(info_comment) > 0) {
+	    strlcat (info_comment, " ", sizeof(info_comment));
+	  }
+	  strlcat (info_comment, tt_user[i].dao, sizeof(info_comment));
 	}
 
 	/* Official limit is 43 characters. */
-	info_comment[MAX_COMMENT_LEN] = '\0';
+	//info_comment[MAX_COMMENT_LEN] = '\0';
 	
 /*
  * Packet header is built from mycall (of transmit channel) and software version.
  */
 
-	strcpy (stemp, save_audio_config_p->achan[save_tt_config_p->obj_xmit_chan].mycall);
-	strcat (stemp, ">");
-	strcat (stemp, APP_TOCALL);
+	if (save_tt_config_p->obj_xmit_chan >= 0) {
+	  strlcpy (stemp, save_audio_config_p->achan[save_tt_config_p->obj_xmit_chan].mycall, sizeof(stemp));
+	}
+	else {
+	  strlcpy (stemp, save_audio_config_p->achan[save_tt_config_p->obj_recv_chan].mycall, sizeof(stemp));
+	}
+	strlcat (stemp, ">", sizeof(stemp));
+	strlcat (stemp, APP_TOCALL, sizeof(stemp));
 	c4[0] = '0' + MAJOR_VERSION;
 	c4[1] = '0' + MINOR_VERSION;
 	c4[2] = '\0';
-	strcat (stemp, c4);
+	strlcat (stemp, c4, sizeof(stemp));
 
 /*
- * Append via path if specified. 
+ * Append via path, for transmission, if specified. 
  */
 
-	if (save_tt_config_p->obj_xmit_via[0] != '\0') {
-	  strcat (stemp, ",");
-	  strcat (stemp, save_tt_config_p->obj_xmit_via);
+	if ( ! first_time && save_tt_config_p->obj_xmit_via[0] != '\0') {
+	  strlcat (stemp, ",", sizeof(stemp));
+	  strlcat (stemp, save_tt_config_p->obj_xmit_via, sizeof(stemp));
 	}
 
-	strcat (stemp, ":");
+	strlcat (stemp, ":", sizeof(stemp));
 
-	encode_object (object_name, 0, tt_user[i].last_heard, olat, olong, 
+	encode_object (object_name, 0, tt_user[i].last_heard, olat, olong, oambig,
 		tt_user[i].overlay, tt_user[i].symbol, 
-		0,0,0,NULL, 0,0,	/* PHGD, C/S */
-		atof(tt_user[i].freq), 0, 0, info_comment, object_info);
+		0,0,0,NULL, G_UNKNOWN, G_UNKNOWN,	/* PHGD, Course/Speed */
+		strlen(tt_user[i].freq) > 0 ? atof(tt_user[i].freq) : G_UNKNOWN,
+		strlen(tt_user[i].ctcss) > 0 ? atof(tt_user[i].ctcss) : G_UNKNOWN,
+		G_UNKNOWN,	/* CTCSS */
+		info_comment, object_info, sizeof(object_info));
 
-	strcat (stemp, object_info);
-
-	//text_color_set(DW_COLOR_ERROR);
-	//printf ("\nDEBUG: %s\n\n", stemp);
-
+	strlcat (stemp, object_info, sizeof(stemp));
 
 #if TT_MAIN
 
@@ -673,31 +856,207 @@ static void xmit_object_report (int i, double c_lat, double c_long, int ambiguit
 
 #else
 
+	if (first_time) {
+	  text_color_set(DW_COLOR_DEBUG);
+	  dw_printf ("[APRStt] %s\n", stemp);
+	}
+
 /*
- * Convert to packet and append to transmit queue.
+ * Convert text to packet.
  */
 	pp = ax25_from_text (stemp, 1);
 
-	flen = ax25_pack (pp, fbuf);
+	if (pp == NULL) {
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("\"%s\"\n", stemp);
+	  return;
+	}
 
-/*
- * Process as if we heard ourself.
+
+/* 
+ * Send to one or more of the following depending on configuration:
+ *	Transmit queue.
+ *	Any attached application(s).
+ * 	IGate.
+ *
+ * When transmitting over the radio, it gets sent multipe times, to help
+ * probablity of being heard, with increasing delays between.
+ *
+ * The other methods are reliable so we only want to send it once.
  */
-	// TODO:  We need radio channel where this came from.
-	// It would make a difference if running two radios
-	// and they have different station identifiers.
- 
-	int chan = 0;
-        igate_send_rec_packet (chan, pp);
 
-	/* Remember it so we don't digipeat our own. */
+	if (first_time && save_tt_config_p->obj_send_to_app)  {
+	  unsigned char fbuf[AX25_MAX_PACKET_LEN];
+	  int flen;
 
-	dedupe_remember (pp, save_tt_config_p->obj_xmit_chan);
+ 	  // TODO1.3:  Put a wrapper around this so we only call one function to send by all methods.
 
-	tq_append (save_tt_config_p->obj_xmit_chan, TQ_PRIO_1_LO, pp);
+	  flen = ax25_pack(pp, fbuf);
+
+	  server_send_rec_packet (save_tt_config_p->obj_recv_chan, pp, fbuf, flen);
+	  kissnet_send_rec_packet (save_tt_config_p->obj_recv_chan, fbuf, flen);
+	  kiss_send_rec_packet (save_tt_config_p->obj_recv_chan, fbuf, flen);
+	}
+
+	if (first_time && save_tt_config_p->obj_send_to_ig)  {
+
+	  //text_color_set(DW_COLOR_DEBUG);
+	  //dw_printf ("xmit_object_report (): send to IGate\n");
+
+          igate_send_rec_packet (save_tt_config_p->obj_recv_chan, pp);
+
+	}
+
+	if ( ! first_time && save_tt_config_p->obj_xmit_chan >= 0) {
+
+	  /* Remember it so we don't digipeat our own. */
+
+	  dedupe_remember (pp, save_tt_config_p->obj_xmit_chan);
+
+	  tq_append (save_tt_config_p->obj_xmit_chan, TQ_PRIO_1_LO, pp);
+	}
+	else {
+	  ax25_delete (pp);
+	}
+
 #endif 
 	
+
 }
+
+static const char *letters[26] = {
+        "Alpha",
+        "Bravo",
+        "Charlie",
+        "Delta",
+        "Echo",
+        "Foxtrot",
+        "Golf",
+        "Hotel",
+        "India",
+        "Juliet",
+        "Kilo",
+        "Lima",
+        "Mike",
+        "November",
+        "Oscar",
+        "Papa",
+        "Quebec",
+        "Romeo",
+        "Sierra",
+        "Tango",
+        "Uniform",
+        "Victor",
+        "Whiskey",
+        "X-ray",
+        "Yankee",
+        "Zulu"
+};
+
+static const char *digits[10] = {
+	"Zero",
+	"One",
+	"Two",
+	"Three",
+	"Four",
+	"Five",
+	"Six",
+	"Seven",
+	"Eight",
+	"Nine"		
+};
+
+
+/*------------------------------------------------------------------
+ *
+ * Name:        tt_setenv
+ *
+ * Purpose:     Put information in environment variables in preparation
+ *		for calling a user-supplied script for custom processing.
+ *
+ * Inputs:      i	- Index into tt_user table.
+ *
+ * Description:	Timestamps displayed relative to current time.
+ *
+ *----------------------------------------------------------------*/
+
+
+static void tt_setenv (int i)
+{
+	char stemp[256];
+	char t2[2];
+	char *p;
+
+	assert (i >= 0 && i < MAX_TT_USERS);
+
+	setenv ("TTCALL", tt_user[i].callsign, 1);
+
+	strlcpy (stemp, "", sizeof(stemp));
+	t2[1] = '\0';
+	for (p = tt_user[i].callsign; *p != '\0'; p++) {
+	  t2[0] = *p;
+	  strlcat (stemp, t2, sizeof(stemp));
+	  if (p[1] != '\0') strlcat (stemp, " ", sizeof(stemp));
+	}
+	setenv ("TTCALLSP", stemp, 1);
+
+	strlcpy (stemp, "", sizeof(stemp));
+	for (p = tt_user[i].callsign; *p != '\0'; p++) {
+	  if (isupper(*p)) {
+	    strlcat (stemp, letters[*p - 'A'], sizeof(stemp));
+	  }
+	  else if (islower(*p)) {
+	    strlcat (stemp, letters[*p - 'a'], sizeof(stemp));
+	  }
+	  else if (isdigit(*p)) {
+	    strlcat (stemp, digits[*p - '0'], sizeof(stemp));
+	  }
+	  else {
+	    t2[0] = *p;
+	    strlcat (stemp, t2, sizeof(stemp));
+	  }
+	  if (p[1] != '\0') strlcat (stemp, " ", sizeof(stemp));
+	}
+	setenv ("TTCALLPH", stemp, 1);
+
+	snprintf (stemp, sizeof(stemp), "%d", tt_user[i].ssid);
+	setenv ("TTSSID",stemp , 1);
+
+	snprintf (stemp, sizeof(stemp), "%d", tt_user[i].count);
+	setenv ("TTCOUNT",stemp , 1);
+
+	snprintf (stemp, sizeof(stemp), "%c%c", tt_user[i].overlay, tt_user[i].symbol);
+	setenv ("TTSYMBOL",stemp , 1);
+
+	snprintf (stemp, sizeof(stemp), "%.6f", tt_user[i].latitude);
+	setenv ("TTLAT",stemp , 1);
+
+	snprintf (stemp, sizeof(stemp), "%.6f", tt_user[i].longitude);
+	setenv ("TTLON",stemp , 1);
+
+	setenv ("TTFREQ", tt_user[i].freq, 1);
+
+	// TODO: Should convert to actual frequency. e.g.  074 becomes 74.4
+	// There is some code for this in decode_aprs.c but not broken out
+	// into a function that we could use from here.
+	// TODO: Document this environment variable after converting.
+
+	setenv ("TTCTCSS", tt_user[i].ctcss, 1);
+
+	setenv ("TTCOMMENT", tt_user[i].comment, 1);
+
+	setenv ("TTLOC", tt_user[i].loc_text, 1);
+
+	if (tt_user[i].mic_e >= '1' && tt_user[i].mic_e <= '9') {
+	  setenv ("TTSTATUS", save_tt_config_p->status[tt_user[i].mic_e - '0'], 1);
+	}
+	else {
+	  setenv ("TTSTATUS", "", 1);
+	}
+
+	setenv ("TTDAO", tt_user[i].dao, 1);
+
+} /* end tt_setenv */
 
 
 
@@ -718,10 +1077,10 @@ void tt_user_dump (void)
 	int i;
 	time_t now = time(NULL);
 	
-	printf ("call  ov suf lsthrd xmit nxt cor  lat    long freq       m comment\n");
+	printf ("call   ov suf lsthrd xmit nxt cor  lat    long freq     ctcss m comment\n");
 	for (i=0; i<MAX_TT_USERS; i++) {
 	  if (tt_user[i].callsign[0] != '\0') {
-	    printf ("%-6s %c%c %-3s %6d %d %+6d %d %6.2f %7.2f %-10s %c %s\n",
+	    printf ("%-6s %c%c %-3s %6d %d %+6d %d %6.2f %7.2f %-10s %-3s %c %s\n",
 	    	tt_user[i].callsign,
 	    	tt_user[i].overlay,
 	    	tt_user[i].symbol,
@@ -733,6 +1092,7 @@ void tt_user_dump (void)
 	    	tt_user[i].latitude,
 	    	tt_user[i].longitude,
 	    	tt_user[i].freq,
+		tt_user[i].ctcss,
 	    	tt_user[i].mic_e,
 	    	tt_user[i].comment);
 	  }
@@ -749,7 +1109,7 @@ void tt_user_dump (void)
  *
  * Description:	Just a smattering, not an organized test.
  *
- * 		$ rm a.exe ; gcc -DTT_MAIN -Iregex tt_user.c tt_text.c encode_aprs.c latlong.c textcolor.c ; ./a.exe
+ * 		$ rm a.exe ; gcc -DTT_MAIN -Iregex tt_user.c tt_text.c encode_aprs.c latlong.c textcolor.c misc.a ; ./a.exe
  *
  *----------------------------------------------------------------*/
 
@@ -770,7 +1130,7 @@ int main (int argc, char *argv[])
 
 	memset (&my_audio_config, 0, sizeof(my_audio_config));
 
-	strcpy (my_audio_config.achan[0].mycall, "WB2OSZ-15");
+	strlcpy (my_audio_config.achan[0].mycall, "WB2OSZ-15", sizeof(my_audio_config.achan[0].mycall));
 
 /* Fake TT gateway config. */
 
@@ -793,21 +1153,25 @@ int main (int argc, char *argv[])
 
 	tt_user_init(&my_audio_config, &my_tt_config);
 
-	tt_user_heard ("TEST1",  12, 'J', 'A', G_UNKNOWN, G_UNKNOWN, "", "", ' ', "!T99!");
+// tt_user_heard (char *callsign, int ssid, char overlay, char symbol, char *loc_text, double latitude,
+//              double longitude, int ambiguity, char *freq, char *ctcss, char *comment, char mic_e, char *dao);
+
+	tt_user_heard ("TEST1",  12, 'J', 'A', "", G_UNKNOWN, G_UNKNOWN, 0, "", "", "", ' ', "!T99!");
 	SLEEP_SEC (1);
-	tt_user_heard ("TEST2",  12, 'J', 'A', G_UNKNOWN, G_UNKNOWN, "", "", ' ', "!T99!");
+	tt_user_heard ("TEST2",  12, 'J', 'A', "", G_UNKNOWN, G_UNKNOWN, 0, "", "", "", ' ', "!T99!");
 	SLEEP_SEC (1);
-	tt_user_heard ("TEST3",  12, 'J', 'A', G_UNKNOWN, G_UNKNOWN, "", "", ' ', "!T99!");
+	tt_user_heard ("TEST3",  12, 'J', 'A', "", G_UNKNOWN, G_UNKNOWN, 0, "", "", "", ' ', "!T99!");
 	SLEEP_SEC (1);
-	tt_user_heard ("TEST4",  12, 'J', 'A', G_UNKNOWN, G_UNKNOWN, "", "", ' ', "!T99!");
+	tt_user_heard ("TEST4",  12, 'J', 'A', "", G_UNKNOWN, G_UNKNOWN, 0, "", "", "", ' ', "!T99!");
 	SLEEP_SEC (1);
-	tt_user_heard ("WB2OSZ", 12, 'J', 'A', G_UNKNOWN, G_UNKNOWN, "", "", ' ', "!T99!");
-	tt_user_heard ("K2H",    12, 'J', 'A', G_UNKNOWN, G_UNKNOWN, "", "", ' ', "!T99!");
+	tt_user_heard ("WB2OSZ", 12, 'J', 'A', "", G_UNKNOWN, G_UNKNOWN, 0, "", "", "", ' ', "!T99!");
+	tt_user_heard ("K2H",    12, 'J', 'A', "", G_UNKNOWN, G_UNKNOWN, 0, "", "", "", ' ', "!T99!");
 	tt_user_dump ();
 
-	tt_user_heard ("679",    12, 'J', 'A', 37.25,     -71.75,    " ", " ", ' ', "!T99!");
-	tt_user_heard ("WB2OSZ", 12, 'J', 'A', G_UNKNOWN, G_UNKNOWN, "146.520MHz", "", ' ', "!T99!");
-	tt_user_heard ("679",    12, 'J', 'A', G_UNKNOWN, G_UNKNOWN, "", "Hello, world", '9', "!T99!");
+	tt_user_heard ("679",    12, 'J', 'A', "", 37.25,     -71.75,    0, "", " ", " ", ' ', "!T99!");
+	tt_user_heard ("WB2OSZ", 12, 'J', 'A', "", G_UNKNOWN, G_UNKNOWN, 0, "146.520MHz", "", "", ' ', "!T99!");
+	tt_user_heard ("WB1GOF", 12, 'J', 'A', "", G_UNKNOWN, G_UNKNOWN, 0, "146.955MHz", "074", "", ' ', "!T99!");
+	tt_user_heard ("679",    12, 'J', 'A', "", G_UNKNOWN, G_UNKNOWN, 0, "", "", "Hello, world", '9', "!T99!");
 	tt_user_dump ();
 	
 	for (n=0; n<30; n++) {

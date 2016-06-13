@@ -1,7 +1,7 @@
 //
 //    This file is part of Dire Wolf, an amateur radio packet TNC.
 //
-//    Copyright (C) 2011, 2013, 2014, 2015  John Langner, WB2OSZ
+//    Copyright (C) 2011, 2013, 2014, 2015, 2016  John Langner, WB2OSZ
 //
 //    This program is free software: you can redistribute it and/or modify
 //    it under the terms of the GNU General Public License as published by
@@ -35,8 +35,16 @@
  *
  * Version 1.1: Add parallel printer port for x86 Linux only.
  *
+ *		This is hardcoded to use the primary motherboard parallel
+ *		printer port at I/O address 0x378.  This might work with
+ *		a PCI card configured to use the same address if the 
+ *		motherboard does not have a built in parallel port.
+ *		It won't work with a USB-to-parallel-printer-port adapter.
+ *
  * Version 1.2: More than two radio channels.
  *		Generalize for additional signals besides PTT.
+ *
+ * Version 1.3:	HAMLIB support.
  *
  * References:	http://www.robbayer.com/files/serial-win.pdf
  *
@@ -44,12 +52,54 @@
  *
  *---------------------------------------------------------------*/
 
+/*
+	Idea for future enhancement:
+
+	A growing number of people have been asking about support for the DMK URI.
+	This uses a C-Media CM108/CM119 with one interesting addition, a GPIO
+	pin is used to drive PTT.  Here is some related information.
+
+	DMK URI:
+
+		http://www.dmkeng.com/URI_Order_Page.htm
+		http://dmkeng.com/images/URI%20Schematic.pdf
+		http://www.repeater-builder.com/voip/pdf/cm119-datasheet.pdf
+
+	Homebrew versions of the same idea:
+
+		http://images.ohnosec.org/usbfob.pdf
+		http://www.qsl.net/kb9mwr/projects/voip/usbfob-119.pdf
+		http://rtpdir.weebly.com/uploads/1/6/8/7/1687703/usbfob.pdf
+		http://www.repeater-builder.com/projects/fob/USB-Fob-Construction.pdf
+
+	Applications that have support for this:
+
+		http://docs.allstarlink.org/drupal/
+		http://soundmodem.sourcearchive.com/documentation/0.16-1/ptt_8c_source.html
+		https://github.com/N0NB/hamlib/blob/master/src/cm108.c#L190
+
+	Information about the "hidraw" device:
+
+		http://unix.stackexchange.com/questions/85379/dev-hidraw-read-permissions
+		http://www.signal11.us/oss/udev/
+		http://www.signal11.us/oss/hidapi/
+		https://github.com/signal11/hidapi/blob/master/libusb/hid.c
+		http://stackoverflow.com/questions/899008/howto-write-to-the-gpio-pin-of-the-cm108-chip-in-linux
+		https://www.kernel.org/doc/Documentation/hid/hidraw.txt
+
+	In version 1.3, we add HAMLIB support which should be able to do this.
+ 	(Linux only & haven't verified that it actually works yet!)
+	
+	Might want to have CM108 GPIO support built in, someday, for simpler building & configuration.
+	Maybe even for Windows.  ;-)
+*/
+
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <string.h>
-#include <sys/time.h>
+#include <time.h>
 
 #if __WIN32__
 #include <windows.h>
@@ -61,6 +111,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
+
+#ifdef USE_HAMLIB
+#include <hamlib/rig.h>
+#endif
 
 /* So we can have more common code for fd. */
 typedef int HANDLE;
@@ -105,6 +159,141 @@ void ptt_set_debug(int debug)
 	ptt_debug_level = debug;
 }
 
+/*-------------------------------------------------------------------
+ *
+ * Name:	export_gpio
+ *
+ * Purpose:	Tell the GPIO subsystem to export a GPIO line for
+ * 	us to use, and set the initial state of the GPIO.
+ *
+ * Inputs:	gpio		- GPIO line to export
+ *		invert:		- Is the GPIO active low?
+ *		direction:	- 0 for input, 1 for output
+ *
+ * Outputs:	None.
+ *
+ *------------------------------------------------------------------*/
+
+#ifndef __WIN32__
+
+void export_gpio(int gpio, int invert, int direction)
+{
+	HANDLE fd;
+	char stemp[80];
+	struct stat finfo;
+	int err;
+
+	fd = open("/sys/class/gpio/export", O_WRONLY);
+	if (fd < 0) {
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("Permissions do not allow ordinary users to access GPIO.\n");
+	  dw_printf ("Log in as root and type this command:\n");
+	  dw_printf ("    chmod go+w /sys/class/gpio/export /sys/class/gpio/unexport\n");
+	  exit (1);
+	}
+	snprintf (stemp, sizeof(stemp), "%d", gpio);
+	if (write (fd, stemp, strlen(stemp)) != strlen(stemp)) {
+	  int e = errno;
+	  /* Ignore EBUSY error which seems to mean */
+	  /* the device node already exists. */
+	  if (e != EBUSY) {
+	    text_color_set(DW_COLOR_ERROR);
+	    dw_printf ("Error writing \"%s\" to /sys/class/gpio/export, errno=%d\n", stemp, e);
+	    dw_printf ("%s\n", strerror(e));
+	    exit (1);
+	  }
+	}
+	close (fd);
+
+/*
+	Idea for future:
+
+	On the RPi, the device path for GPIO number XX is /sys/class/gpio/gpioXX.
+	There was a report that it is different for the Cubieboard.  For instance
+	GPIO 61 has gpio61_pi13 in the path.  This indicates connector "i" pin 13.
+
+	For another similar single board computer, we find the same thing:
+	https://www.olimex.com/wiki/A20-OLinuXino-LIME#GPIO_under_Linux
+
+	How should we deal with this?  Some possibilities:
+
+	(1) The user might explicitly mention the name in direwolf.conf.
+	(2) We might be able to find the names in some system device config file.
+	(3) Get a directory listing of /sys/class/gpio then search for a 
+		matching name.  Suppose we wanted GPIO 61.  First look for an exact
+		match to "gpio61".  If that is not found, look for something
+		matching the pattern "gpio61_*".
+*/
+
+/*
+ * We will have the same permission problem if not root.
+ * We only care about "direction" and "value".
+ */
+	snprintf (stemp, sizeof(stemp), "sudo chmod go+rw /sys/class/gpio/gpio%d/direction", gpio);
+	err = system (stemp);
+	snprintf (stemp, sizeof(stemp), "sudo chmod go+rw /sys/class/gpio/gpio%d/value", gpio);
+	err = system (stemp);
+	(void)err;
+
+	snprintf (stemp, sizeof(stemp), "/sys/class/gpio/gpio%d/value", gpio);
+
+	if (stat(stemp, &finfo) < 0) {
+	  int e = errno;
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("Failed to get status for %s \n", stemp);
+	  dw_printf ("%s\n", strerror(e));
+	  exit (1);
+	}
+
+	if (geteuid() != 0) {
+	  if ( ! (finfo.st_mode & S_IWOTH)) {
+	    text_color_set(DW_COLOR_ERROR);
+	    dw_printf ("Permissions do not allow ordinary users to access GPIO.\n");
+	    dw_printf ("Log in as root and type these commands:\n");
+	    dw_printf ("    chmod go+rw /sys/class/gpio/gpio%d/direction", gpio);
+	    dw_printf ("    chmod go+rw /sys/class/gpio/gpio%d/value", gpio);
+	    exit (1);
+	  }
+	}
+
+/*
+ * Set output direction and initial state
+ */
+
+	snprintf (stemp, sizeof(stemp), "/sys/class/gpio/gpio%d/direction", gpio);
+	fd = open(stemp, O_WRONLY);
+	if (fd < 0) {
+	  int e = errno;
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("Error opening %s\n", stemp);
+	  dw_printf ("%s\n", strerror(e));
+	  exit (1);
+	}
+
+	char gpio_val[8];
+	if (direction) {
+	  if (invert) {
+	    strlcpy (gpio_val, "high", sizeof(gpio_val));
+	  }
+	  else {
+	    strlcpy (gpio_val, "low", sizeof(gpio_val));
+	  }
+	}
+	else {
+	  strlcpy (gpio_val, "in", sizeof(gpio_val));
+	}
+	if (write (fd, gpio_val, strlen(gpio_val)) != strlen(gpio_val)) {
+	  int e = errno;
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("Error writing initial state to %s\n", stemp);
+	  dw_printf ("%s\n", strerror(e));
+	  exit (1);
+	}
+	close (fd);
+}
+
+#endif   /* not __WIN32__ */
+
 
 /*-------------------------------------------------------------------
  *
@@ -121,9 +310,11 @@ void ptt_set_debug(int debug)
  *					PTT_METHOD_SERIAL - serial (com) port. 
  *					PTT_METHOD_GPIO - general purpose I/O. 
  *					PTT_METHOD_LPT - Parallel printer port. 
+ *                  			PTT_METHOD_HAMLIB - HAMLib rig control.
  *			
  *			ptt_device	Name of serial port device.  
  *					 e.g. COM1 or /dev/ttyS0. 
+ *					 HAMLIB can also use hostaddr:port.
  *			
  *			ptt_line	RTS or DTR when using serial port. 
  *			
@@ -136,6 +327,11 @@ void ptt_set_debug(int debug)
  *			
  *			ptt_invert	Invert the signal.  
  *					 Normally higher voltage means transmit or LED on. 
+ *
+ *			ptt_model	Only for HAMLIB.
+ *					2 to communicate with rigctld.
+ *					>= 3 for specific radio model.
+ *					-1 guess at what is out there.  (AUTO option in config file.)
  *
  * Outputs:	Remember required information for future use.
  *
@@ -151,14 +347,16 @@ static HANDLE ptt_fd[MAX_CHANS][NUM_OCTYPES];
 					/* Serial port handle or fd.  */
 					/* Could be the same for two channels */	
 					/* if using both RTS and DTR. */
-
+#if USE_HAMLIB
+static RIG *rig[MAX_CHANS][NUM_OCTYPES];
+#endif
 
 static char otnames[NUM_OCTYPES][8];
 
 void ptt_init (struct audio_s *audio_config_p)
 {
 	int ch;
-	HANDLE fd;
+	HANDLE fd = INVALID_HANDLE_VALUE;
 #if __WIN32__
 #else
 	int using_gpio;
@@ -171,9 +369,9 @@ void ptt_init (struct audio_s *audio_config_p)
 
 	save_audio_config_p = audio_config_p;
 
-	strcpy (otnames[OCTYPE_PTT], "PTT");
-	strcpy (otnames[OCTYPE_DCD], "DCD");
-	strcpy (otnames[OCTYPE_FUTURE], "FUTURE");
+	strlcpy (otnames[OCTYPE_PTT], "PTT", sizeof(otnames[OCTYPE_PTT]));
+	strlcpy (otnames[OCTYPE_DCD], "DCD", sizeof(otnames[OCTYPE_DCD]));
+	strlcpy (otnames[OCTYPE_FUTURE], "FUTURE", sizeof(otnames[OCTYPE_FUTURE]));
 
 
 	for (ch = 0; ch < MAX_CHANS; ch++) {
@@ -182,7 +380,9 @@ void ptt_init (struct audio_s *audio_config_p)
 	  for (ot = 0; ot < NUM_OCTYPES; ot++) {
 
 	    ptt_fd[ch][ot] = INVALID_HANDLE_VALUE;
-
+#if USE_HAMLIB
+	    rig[ch][ot] = NULL;
+#endif
 	    if (ptt_debug_level >= 2) {
 
 	      text_color_set(DW_COLOR_DEBUG);
@@ -222,7 +422,7 @@ void ptt_init (struct audio_s *audio_config_p)
 	          text_color_set(DW_COLOR_INFO);
 	          dw_printf ("Converted %s device '%s'", audio_config_p->achan[ch].octrl[ot].ptt_device, otnames[ot]);
 	          if (n < 1) n = 1;
-	          sprintf (audio_config_p->achan[ch].octrl[ot].ptt_device, "/dev/ttyS%d", n-1);
+	          snprintf (audio_config_p->achan[ch].octrl[ot].ptt_device, sizeof(audio_config_p->achan[ch].octrl[ot].ptt_device), "/dev/ttyS%d", n-1);
 	          dw_printf (" to Linux equivalent '%s'\n", audio_config_p->achan[ch].octrl[ot].ptt_device);
 	        }
 #endif
@@ -253,13 +453,13 @@ void ptt_init (struct audio_s *audio_config_p)
 	          // Bug fix in release 1.1 - Need to munge name for COM10 and up.
 	          // http://support.microsoft.com/kb/115831
 
-	          strcpy (bettername, audio_config_p->achan[ch].octrl[ot].ptt_device);
+	          strlcpy (bettername, audio_config_p->achan[ch].octrl[ot].ptt_device, sizeof(bettername));
 	          if (strncasecmp(bettername, "COM", 3) == 0) {
 	            int n;
 	            n = atoi(bettername+3);
 	            if (n >= 10) {
-	              strcpy (bettername, "\\\\.\\");
-	              strcat (bettername, audio_config_p->achan[ch].octrl[ot].ptt_device);
+	              strlcpy (bettername, "\\\\.\\", sizeof(bettername));
+	              strlcat (bettername, audio_config_p->achan[ch].octrl[ot].ptt_device, sizeof(bettername));
 	            }
 	          }
 	          fd = CreateFile(bettername,
@@ -287,7 +487,7 @@ void ptt_init (struct audio_s *audio_config_p)
 			audio_config_p->achan[ch].octrl[ot].ptt_device, ch);
 #if __WIN32__
 #else
-	          dw_printf ("%s\n", strerror(errno));
+	          dw_printf ("%s\n", strerror(e));
 #endif
 	          /* Don't try using it later if device open failed. */
 
@@ -323,6 +523,11 @@ void ptt_init (struct audio_s *audio_config_p)
 	    int ot;
 	    for (ot = 0; ot < NUM_OCTYPES; ot++) {
 	      if (audio_config_p->achan[ch].octrl[ot].ptt_method == PTT_METHOD_GPIO) {
+	        using_gpio = 1;
+	      }
+	    }
+	    for (ot = 0; ot < NUM_ICTYPES; ot++) {
+	      if (audio_config_p->achan[ch].ictrl[ot].method == PTT_METHOD_GPIO) {
 	        using_gpio = 1;
 	      }
 	    }
@@ -392,91 +597,12 @@ void ptt_init (struct audio_s *audio_config_p)
 	    int ot;
 	    for (ot = 0; ot < NUM_OCTYPES; ot++) {
 	      if (audio_config_p->achan[ch].octrl[ot].ptt_method == PTT_METHOD_GPIO) {
-	        char stemp[80];
-	        struct stat finfo;
-	        int err;
-
-	        fd = open("/sys/class/gpio/export", O_WRONLY);
-	        if (fd < 0) {
-	          text_color_set(DW_COLOR_ERROR);
-	          dw_printf ("Permissions do not allow ordinary users to access GPIO.\n");
-	          dw_printf ("Log in as root and type this command:\n");
-	          dw_printf ("    chmod go+w /sys/class/gpio/export /sys/class/gpio/unexport\n");
-	          exit (1);
-	        }
-	        sprintf (stemp, "%d", audio_config_p->achan[ch].octrl[ot].ptt_gpio);
-	        if (write (fd, stemp, strlen(stemp)) != strlen(stemp)) {
-	          int e = errno;
-	          /* Ignore EBUSY error which seems to mean */
-	          /* the device node already exists. */
-	          if (e != EBUSY) {
-	            text_color_set(DW_COLOR_ERROR);
-	            dw_printf ("Error writing \"%s\" to /sys/class/gpio/export, errno=%d\n", stemp, e);
-	            dw_printf ("%s\n", strerror(e));
-	            exit (1);
-	          }
-	        }
-	        close (fd);
-
-/*
- * We will have the same permission problem if not root.
- * We only care about "direction" and "value".
- */
-	        sprintf (stemp, "sudo chmod go+rw /sys/class/gpio/gpio%d/direction", audio_config_p->achan[ch].octrl[ot].ptt_gpio);
-	        err = system (stemp);
-	        sprintf (stemp, "sudo chmod go+rw /sys/class/gpio/gpio%d/value", audio_config_p->achan[ch].octrl[ot].ptt_gpio);
-	        err = system (stemp);
-
-	        sprintf (stemp, "/sys/class/gpio/gpio%d/value", audio_config_p->achan[ch].octrl[ot].ptt_gpio);
-
-	        if (stat(stemp, &finfo) < 0) {
-	          int e = errno;
-	          text_color_set(DW_COLOR_ERROR);
-	          dw_printf ("Failed to get status for %s \n", stemp);
-	          dw_printf ("%s\n", strerror(e));
-	          exit (1);
-	        }
-
-	        if (geteuid() != 0) {
-	          if ( ! (finfo.st_mode & S_IWOTH)) {
-	            text_color_set(DW_COLOR_ERROR);
-	            dw_printf ("Permissions do not allow ordinary users to access GPIO.\n");
-	            dw_printf ("Log in as root and type these commands:\n");
-	            dw_printf ("    chmod go+rw /sys/class/gpio/gpio%d/direction", audio_config_p->achan[ch].octrl[ot].ptt_gpio);
-	            dw_printf ("    chmod go+rw /sys/class/gpio/gpio%d/value", audio_config_p->achan[ch].octrl[ot].ptt_gpio);
-	            exit (1);
-	          }
-	        }
-
-/*
- * Set output direction with initial state off.
- */
-
-	        sprintf (stemp, "/sys/class/gpio/gpio%d/direction", audio_config_p->achan[ch].octrl[ot].ptt_gpio);
-	        fd = open(stemp, O_WRONLY);
-	        if (fd < 0) {
-	          int e = errno;
-	          text_color_set(DW_COLOR_ERROR);
-	          dw_printf ("Error opening %s\n", stemp);
-	          dw_printf ("%s\n", strerror(e));
-	          exit (1);
-	        }
-
-	        char hilo[8];
-	        if (audio_config_p->achan[ch].octrl[ot].ptt_invert) {
-	          strcpy (hilo, "high");
-	        }
-	        else {
-	          strcpy (hilo, "low");
-	        }
-	        if (write (fd, hilo, strlen(hilo)) != strlen(hilo)) {
-	          int e = errno;
-	          text_color_set(DW_COLOR_ERROR);
-	          dw_printf ("Error writing initial state to %s\n", stemp);
-	          dw_printf ("%s\n", strerror(e));
-	          exit (1);
-	        }
-	        close (fd);
+	        export_gpio(audio_config_p->achan[ch].octrl[ot].ptt_gpio, audio_config_p->achan[ch].octrl[ot].ptt_invert, 1);
+	      }
+	    }
+	    for (ot = 0; ot < NUM_ICTYPES; ot++) {
+	      if (audio_config_p->achan[ch].ictrl[ot].method == PTT_METHOD_GPIO) {
+	        export_gpio(audio_config_p->achan[ch].ictrl[ot].gpio, audio_config_p->achan[ch].ictrl[ot].invert, 0);
 	      }
 	    }
 	  }
@@ -534,7 +660,7 @@ void ptt_init (struct audio_s *audio_config_p)
 
 	          text_color_set(DW_COLOR_ERROR);
 	          dw_printf ("ERROR - Can't open /dev/port for parallel printer port PTT control.\n");
-	          dw_printf ("%s\n", strerror(errno));
+	          dw_printf ("%s\n", strerror(e));
 	          dw_printf ("You probably don't have adequate permissions to access I/O ports.\n");
 	          dw_printf ("Either run direwolf as root or change these permissions:\n");
 	          dw_printf ("  sudo chmod go+rw /dev/port\n");
@@ -561,6 +687,66 @@ void ptt_init (struct audio_s *audio_config_p)
 
 #endif /* x86 Linux */
 
+#ifdef USE_HAMLIB
+	for (ch = 0; ch < MAX_CHANS; ch++) {
+	  if (save_audio_config_p->achan[ch].valid) {
+	    int ot;
+	    for (ot = 0; ot < NUM_OCTYPES; ot++) {
+	      if (audio_config_p->achan[ch].octrl[ot].ptt_method == PTT_METHOD_HAMLIB) {
+	        if (ot == OCTYPE_PTT) {
+
+	          /* For "AUTO" model, try to guess what is out there. */
+
+	          if (audio_config_p->achan[ch].octrl[ot].ptt_model == -1) {
+	            hamlib_port_t hport;
+
+	            memset (&hport, 0, sizeof(hport));
+	            strlcpy (hport.pathname, audio_config_p->achan[ch].octrl[ot].ptt_device, sizeof(hport.pathname));
+	            rig_load_all_backends();
+                    audio_config_p->achan[ch].octrl[ot].ptt_model = rig_probe(&hport);
+
+	            if (audio_config_p->achan[ch].octrl[ot].ptt_model == RIG_MODEL_NONE) {
+	              text_color_set(DW_COLOR_ERROR);
+	              dw_printf ("Couldn't guess rig model number for AUTO option.  Run \"rigctl --list\" for a list of model numbers.\n");
+	              continue;
+	            }
+
+	            text_color_set(DW_COLOR_INFO);
+	            dw_printf ("Hamlib AUTO option detected rig model %d.  Run \"rigctl --list\" for a list of model numbers.\n",
+							audio_config_p->achan[ch].octrl[ot].ptt_model);
+	          }
+
+	          rig[ch][ot] = rig_init(audio_config_p->achan[ch].octrl[ot].ptt_model);
+	          if (rig[ch][ot] == NULL) {
+	            text_color_set(DW_COLOR_ERROR);
+	            dw_printf ("Unknown rig model %d for hamlib.  Run \"rigctl --list\" for a list of model numbers.\n", 
+	                          audio_config_p->achan[ch].octrl[ot].ptt_model);
+	            continue;
+	          }
+
+	          strlcpy (rig[ch][ot]->state.rigport.pathname, audio_config_p->achan[ch].octrl[ot].ptt_device, sizeof(rig[ch][ot]->state.rigport.pathname));
+	          int err = rig_open(rig[ch][ot]);
+	          if (err != RIG_OK) {
+	            text_color_set(DW_COLOR_ERROR);
+	            dw_printf ("Hamlib Rig open error %d: %s\n", err, rigerror(err));
+	            rig_cleanup (rig[ch][ot]);
+	            rig[ch][ot] = NULL;
+	            continue;
+	          }
+
+       		  /* Successful.  Later code should check for rig[ch][ot] not NULL. */
+	        }
+	        else {
+                  text_color_set(DW_COLOR_ERROR);
+                  dw_printf ("HAMLIB can only be used for PTT.  Not DCD or other output.\n");
+	        }
+	      }
+	    }
+	  }
+	}
+
+#endif
+
 
 /* Why doesn't it transmit?  Probably forgot to specify PTT option. */
 
@@ -586,7 +772,7 @@ void ptt_init (struct audio_s *audio_config_p)
  *		probably be renamed something like octrl_set.
  *
  * Inputs:	ot		- Output control type:
- *				   OCTYPE_PTT, OCTYPE_DCD, OCTYPE_FUTURE
+ *				   OCTYPE_PTT, OCTYPE_DCD, OCTYPE_HAMLIB, OCTYPE_FUTURE
  *
  *		chan		- channel, 0 .. (number of channels)-1
  *
@@ -696,7 +882,7 @@ void ptt_set (int ot, int chan, int ptt_signal)
 	  int fd;
 	  char stemp[80];
 
-	  sprintf (stemp, "/sys/class/gpio/gpio%d/value", save_audio_config_p->achan[chan].octrl[ot].ptt_gpio);
+	  snprintf (stemp, sizeof(stemp), "/sys/class/gpio/gpio%d/value", save_audio_config_p->achan[chan].octrl[ot].ptt_gpio);
 
 	  fd = open(stemp, O_WRONLY);
 	  if (fd < 0) {
@@ -707,7 +893,7 @@ void ptt_set (int ot, int chan, int ptt_signal)
 	    return;
 	  }
 
-	  sprintf (stemp, "%d", ptt);
+	  snprintf (stemp, sizeof(stemp), "%d", ptt);
 
 	  if (write (fd, stemp, 1) != 1) {
 	    int e = errno;
@@ -730,7 +916,7 @@ void ptt_set (int ot, int chan, int ptt_signal)
 		ptt_fd[chan][ot] != INVALID_HANDLE_VALUE) {
 
 	  char lpt_data;
-	  ssize_t n;		
+	  //ssize_t n;		
 
 	  lseek (ptt_fd[chan][ot], (off_t)LPT_IO_ADDR, SEEK_SET);
 	  if (read (ptt_fd[chan][ot], &lpt_data, (size_t)1) != 1) {
@@ -758,10 +944,94 @@ void ptt_set (int ot, int chan, int ptt_signal)
 
 #endif /* x86 Linux */
 
+#ifdef USE_HAMLIB
+/*
+ * Using hamlib?
+ */
+
+	if (save_audio_config_p->achan[chan].octrl[ot].ptt_method == PTT_METHOD_HAMLIB) {
+
+	  if (rig[chan][ot] != NULL) {
+
+	    int retcode = rig_set_ptt(rig[chan][ot], RIG_VFO_CURR, ptt ? RIG_PTT_ON : RIG_PTT_OFF);
+
+	    if (retcode != RIG_OK) {
+	      text_color_set(DW_COLOR_ERROR);
+	      dw_printf ("Error sending rig_set_ptt command for channel %d %s\n", chan, otnames[ot]);
+	      dw_printf ("%s\n", rigerror(retcode));
+	    }
+	  }
+	  else {
+	    text_color_set(DW_COLOR_ERROR);
+	    dw_printf ("Can't use rig_set_ptt for channel %d %s because rig_open failed.\n", chan, otnames[ot]);
+	  }
+	}
+#endif
+
 
 } /* end ptt_set */
 
+/*-------------------------------------------------------------------
+ *
+ * Name:	get_input
+ *
+ * Purpose:	Read the value of an input line
+ *
+ * Inputs:	it	- Input type (ICTYPE_TCINH supported so far)
+ * 		chan	- Audio channel number
+ * 
+ * Outputs:	0 = inactive, 1 = active, -1 = error
+ *
+ * ------------------------------------------------------------------*/
 
+int get_input (int it, int chan)
+{
+	assert (it >= 0 && it < NUM_ICTYPES);
+	assert (chan >= 0 && chan < MAX_CHANS);
+
+	if ( ! save_audio_config_p->achan[chan].valid) {
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("Internal error, get_input ( %d, %d ), did not expect invalid channel.\n", it, chan);
+	  return -1;
+	}
+	
+#if __WIN32__
+#else
+	if (save_audio_config_p->achan[chan].ictrl[it].method == PTT_METHOD_GPIO) {
+	  int fd;
+	  char stemp[80];
+
+	  snprintf (stemp, sizeof(stemp), "/sys/class/gpio/gpio%d/value", save_audio_config_p->achan[chan].ictrl[it].gpio);
+
+	  fd = open(stemp, O_RDONLY);
+	  if (fd < 0) {
+	    int e = errno;
+	    text_color_set(DW_COLOR_ERROR);
+	    dw_printf ("Error opening %s to check input.\n", stemp);
+	    dw_printf ("%s\n", strerror(e));
+	    return -1;
+	  }
+
+	  char vtemp[2];
+	  if (read (fd, vtemp, 1) != 1) {
+	    int e = errno;
+	    text_color_set(DW_COLOR_ERROR);
+	    dw_printf ("Error getting GPIO %d value\n", save_audio_config_p->achan[chan].ictrl[it].gpio);
+	    dw_printf ("%s\n", strerror(e));
+	  }
+	  close (fd);
+
+	  if (atoi(vtemp) != save_audio_config_p->achan[chan].ictrl[it].invert) {
+	    return 1;
+	  }
+	  else {
+	    return 0;
+	  }
+	}
+#endif
+
+	return -1;	/* Method was none, or something went wrong */
+}
 
 /*-------------------------------------------------------------------
  *
@@ -803,6 +1073,23 @@ void ptt_term (void)
 	    }
 	  }
 	}
+
+#ifdef USE_HAMLIB
+
+	for (n = 0; n < MAX_CHANS; n++) {
+	  if (save_audio_config_p->achan[n].valid) {
+	    int ot;
+	    for (ot = 0; ot < NUM_OCTYPES; ot++) {
+	      if (rig[n][ot] != NULL) {
+
+	        rig_close(rig[n][ot]);
+	        rig_cleanup(rig[n][ot]);
+	        rig[n][ot] = NULL;
+	      }
+	    }
+	  }
+	}
+#endif
 }
 
 
@@ -834,14 +1121,14 @@ main ()
 
 	my_audio_config.valid[0] = 1;
 	my_audio_config.adev[0].octrl[OCTYPE_PTT].ptt_method = PTT_METHOD_SERIAL;
-	//strcpy (my_audio_config.ptt_device, "COM1");
-	strcpy (my_audio_config.ptt_device, "/dev/ttyUSB0");
+	//strlcpy (my_audio_config.ptt_device, "COM1", sizeof(my_audio_config.ptt_device));
+	strlcpy (my_audio_config.ptt_device, "/dev/ttyUSB0", sizeof(my_audio_config.ptt_device));
 	my_audio_config.adev[0].octrl[OCTYPE_PTT].ptt_line = PTT_LINE_RTS;
 
 	my_audio_config.valid[1] = 1;
 	my_audio_config.adev[1].octrl[OCTYPE_PTT].ptt_method = PTT_METHOD_SERIAL;
-	//strcpy (my_audio_config.adev[1].octrl[OCTYPE_PTT].ptt_device, "COM1");
-	strcpy (my_audio_config.adev[1].octrl[OCTYPE_PTT].ptt_device, "/dev/ttyUSB0");
+	//strlcpy (my_audio_config.adev[1].octrl[OCTYPE_PTT].ptt_device, "COM1", sizeof(my_audio_config.adev[1].octrl[OCTYPE_PTT].ptt_device));
+	strlcpy (my_audio_config.adev[1].octrl[OCTYPE_PTT].ptt_device, "/dev/ttyUSB0", sizeof(my_audio_config.adev[1].octrl[OCTYPE_PTT].ptt_device));
 	my_audio_config.adev[1].octrl[OCTYPE_PTT].ptt_line = PTT_LINE_DTR;
 
 

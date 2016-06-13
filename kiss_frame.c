@@ -70,10 +70,8 @@
 
 #include <stdio.h>
 #include <unistd.h>
-
 #include <stdlib.h>
 #include <ctype.h>
-
 #include <assert.h>
 #include <string.h>
 
@@ -91,7 +89,7 @@ void hex_dump (unsigned char *p, int len);
 static void kiss_process_msg (unsigned char *kiss_msg, int kiss_len, int debug);
 
 
-#if TEST
+#if KISSTEST
 
 #define dw_printf printf
 
@@ -131,6 +129,12 @@ void kiss_frame_init (struct audio_s *pa)
  * Inputs:	in	- Address of input block.
  *			  First byte is the "type indicator" with type and 
  *			  channel but we don't care about that here.
+ *
+ *			  This seems cumbersome and confusing to have this
+ *			  one byte offset when encapsulating an AX.25 frame.
+ *			  Maybe the type/channel byte should be passed in 
+ *			  as a separate argument.
+ *
  *			  Note that this is "binary" data and can contain
  *			  nul (0x00) values.   Don't treat it like a text string!
  *
@@ -176,6 +180,7 @@ int kiss_encapsulate (unsigned char *in, int ilen, unsigned char *out)
 }  /* end kiss_encapsulate */
 
 
+#ifndef WALK96
 
 /*-------------------------------------------------------------------
  *
@@ -268,7 +273,7 @@ static int kiss_unwrap (unsigned char *in, int ilen, unsigned char *out)
 }  /* end kiss_unwrap */
 
 
-#ifndef TEST
+#ifndef KISSTEST
 
 
 
@@ -319,7 +324,7 @@ static int kiss_unwrap (unsigned char *in, int ilen, unsigned char *out)
 void kiss_rec_byte (kiss_frame_t *kf, unsigned char ch, int debug, void (*sendfun)(int,unsigned char*,int)) 
 {
 
-	//printf ("kiss_frame ( %c %02x ) \n", ch, ch);
+	//dw_printf ("kiss_frame ( %c %02x ) \n", ch, ch);
 	
 	switch (kf->state) {
 	 
@@ -618,11 +623,11 @@ void kiss_debug_print (fromto_t fromto, char *special, unsigned char *pmsg, int 
 
 /* Quick unit test for encapsulate & unwrap */
 
-// $ gcc -DTEST kiss_frame.c ; ./a
+// $ gcc -DKISSTEST kiss_frame.c ; ./a
 // Quick KISS test passed OK.
 
 
-#if TEST
+#if KISSTEST
 
 
 main ()
@@ -654,9 +659,12 @@ main ()
 	assert (dlen == 512);
 	assert (memcmp(din, dout, 512) == 0);
 
-	printf ("Quick KISS test passed OK.\n");
+	dw_printf ("Quick KISS test passed OK.\n");
+	exit (EXIT_SUCCESS);
 }
 
 #endif
+
+#endif /* WALK96 */
 
 /* end kiss_frame.c */

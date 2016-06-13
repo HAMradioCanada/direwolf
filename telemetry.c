@@ -57,10 +57,6 @@
 #include <math.h>
 #include <ctype.h>
 
-#if __WIN32__
-char *strsep(char **stringp, const char *delim);
-#endif
-
 #include "direwolf.h"
 #include "ax25_pad.h"			// for packet_t, AX25_MAX_ADDR_LEN
 #include "decode_aprs.h"		// for decode_aprs_t, G_UNKNOWN  
@@ -117,7 +113,7 @@ struct t_metadata_s {
 
 static 	struct t_metadata_s * md_list_head = NULL;
 
-static void t_data_process (struct t_metadata_s *pm, int seq, float araw[T_NUM_ANALOG], int ndp[T_NUM_ANALOG], int draw[T_NUM_DIGITAL], char *output); 
+static void t_data_process (struct t_metadata_s *pm, int seq, float araw[T_NUM_ANALOG], int ndp[T_NUM_ANALOG], int draw[T_NUM_DIGITAL], char *output, size_t outputsize); 
 
 
 /*-------------------------------------------------------------------
@@ -129,14 +125,14 @@ static void t_data_process (struct t_metadata_s *pm, int seq, float araw[T_NUM_A
  *
  * Inputs:	station		- Station name with optional SSID.
  *
- * REturns:	Pointer to metadata.
+ * Returns:	Pointer to metadata.
  *
  *--------------------------------------------------------------------*/
 
 static struct t_metadata_s * t_get_metadata (char *station)
 {
 	struct t_metadata_s *p;
-	int n, j;
+	int n;
 
 #if DEBUG3
 	text_color_set(DW_COLOR_DEBUG);
@@ -145,6 +141,10 @@ static struct t_metadata_s * t_get_metadata (char *station)
 
 	for (p = md_list_head; p != NULL; p = p->pnext) {
 	  if (strcmp(station, p->station) == 0) {
+
+	    assert (p->magic1 == MAGIC1);
+	    assert (p->magic2 == MAGIC2);
+
 	    return (p);
 	  }
 	}
@@ -153,13 +153,14 @@ static struct t_metadata_s * t_get_metadata (char *station)
 	memset (p, 0, sizeof (struct t_metadata_s));
 
 	p->magic1 = MAGIC1;
-	strncpy (p->station, station, sizeof(p->station)-1);
+	
+	strlcpy (p->station, station, sizeof(p->station));
 
 	for (n = 0; n < T_NUM_ANALOG; n++) {
-	  sprintf (p->name[n], "A%d", n+1);
+	  snprintf (p->name[n], sizeof(p->name[n]), "A%d", n+1);
 	}
 	for (n = 0; n < T_NUM_DIGITAL; n++) {
-	  sprintf (p->name[T_NUM_ANALOG+n], "D%d", n+1);
+	  snprintf (p->name[T_NUM_ANALOG+n], sizeof(p->name[T_NUM_ANALOG+n]), "D%d", n+1);
 	}
 
 	for (n = 0; n < T_NUM_ANALOG; n++) {
@@ -232,6 +233,7 @@ static int t_ndp (char *str)
  *		quiet	- suppress error messages.
  *
  * Outputs:	output	- Decoded telemetry in human readable format.
+ *				TODO:  How big does it need to be?  (buffer overflow?)
  *		comment	- Any comment after the data.
  *
  * Description:	The first character, after the "T" data type indicator, must be "#" 
@@ -249,11 +251,11 @@ static int t_ndp (char *str)
  *			KB1GKN-10>APRX27,UNCAN,WIDE1*:T#491,4.9,0.3,25.0,0.0,1.0,00000000
  *
  *		Not integers.  Not fixed width fields.
- *		We will accept these but issue a warning that others might not.		
+ *		We will accept these but issue a warning that others might not.
  *		
  *--------------------------------------------------------------------*/
 
-void telemetry_data_original (char *station, char *info, int quiet, char *output, char *comment) 
+void telemetry_data_original (char *station, char *info, int quiet, char *output, size_t outputsize, char *comment, size_t commentsize) 
 {
 	int n;
 	int seq;
@@ -274,7 +276,14 @@ void telemetry_data_original (char *station, char *info, int quiet, char *output
 	dw_printf ("\n%s\n\n", info);
 #endif
 
+	strlcpy (output, "", outputsize);
+	strlcpy (comment, "", commentsize);
+
 	pm = t_get_metadata(station);
+
+	assert (pm->magic1 == MAGIC1);
+	assert (pm->magic2 == MAGIC2);
+
 	seq = 0;
 	for (n = 0; n < T_NUM_ANALOG; n++) {
 	  araw[n] = G_UNKNOWN;
@@ -294,10 +303,14 @@ void telemetry_data_original (char *station, char *info, int quiet, char *output
 
 /*
  * Make a copy of the input string because this will alter it.
+ * Remove any trailing CR/LF.
  */
 
-	strncpy (stemp, info+2, sizeof(stemp));
-	stemp[sizeof(stemp)-1] = '\0';
+	strlcpy (stemp, info+2, sizeof(stemp));
+
+	for (p = stemp + strlen(stemp) - 1; p >= stemp && (*p == '\r' || *p == '\n') ; p--) {
+	  *p = '\0';
+	} 
 
 	next = stemp;
 	p = strsep(&next,",");
@@ -309,13 +322,16 @@ void telemetry_data_original (char *station, char *info, int quiet, char *output
 	      araw[n] = atof(p);
 	      ndp[n] = t_ndp(p);
 	    }
-	    if (strlen(p) != 3 || araw[n] < 0 || araw[n] > 255 || araw[n] != (int)(araw[n])) {
-	      if ( ! quiet) {
-	        text_color_set(DW_COLOR_ERROR);
-	        dw_printf("Telemetry analog values should be 3 digit integer values in range of 000 to 255.\n");	      
-	        dw_printf("Some applications might not interpret \"%s\" properly.\n", p);
-	      }	      
-	    }
+	    // Version 1.3: Suppress this message.
+	    // No one pays attention to the original 000 to 255 range.
+	    // BTW, this doesn't trap values like 0.0 or 1.0
+	    //if (strlen(p) != 3 || araw[n] < 0 || araw[n] > 255 || araw[n] != (int)(araw[n])) {
+	    //  if ( ! quiet) {
+	    //    text_color_set(DW_COLOR_ERROR);
+	    //    dw_printf("Telemetry analog values should be 3 digit integer values in range of 000 to 255.\n");	      
+	    //    dw_printf("Some applications might not interpret \"%s\" properly.\n", p);
+	    //  }	      
+	    //}
 	    n++;
 	  }
 
@@ -331,8 +347,10 @@ void telemetry_data_original (char *station, char *info, int quiet, char *output
 	        dw_printf("Expected to find 8 binary digits after \"%s\" for the digital values.\n", p);	
 	      }      
 	    }
+
+	    // TODO: test this!
 	    if (strlen(next) > 8) {
-	      strcpy (comment, next+8);
+	      strlcpy (comment, next+8, commentsize);
 	      next[8] = '\0';
 	    }
 	    for (k = 0; k < strlen(next); k++) {
@@ -374,7 +392,7 @@ void telemetry_data_original (char *station, char *info, int quiet, char *output
 
 #endif
 
-	t_data_process (pm, seq, araw, ndp, draw, output);
+	t_data_process (pm, seq, araw, ndp, draw, output, outputsize);
 
 } /* end telemtry_data_original */
 
@@ -393,7 +411,7 @@ void telemetry_data_original (char *station, char *info, int quiet, char *output
  * Description:	We are expecting from 2 to 7 pairs of base 91 digits.
  *		The first pair is the sequence number.
  *		Next we have 1 to 5 analog values.
- *		If digital values are present, all 5 analog values must be present.	
+ *		If digital values are present, all 5 analog values must be present.
  *		
  *--------------------------------------------------------------------*/
 
@@ -416,6 +434,7 @@ static int two_base91_to_i (char *c)
 	else {
 	  text_color_set(DW_COLOR_DEBUG);
 	  dw_printf ("\"%c\" is not a valid character for base 91 telemetry data.\n", c[0]);
+	  return (G_UNKNOWN);
 	}
 
 	if (isdigit91(c[1])) {
@@ -424,11 +443,12 @@ static int two_base91_to_i (char *c)
 	else {
 	  text_color_set(DW_COLOR_DEBUG);
 	  dw_printf ("\"%c\" is not a valid character for base 91 telemetry data.\n", c[1]);
+	  return (G_UNKNOWN);
 	}
 	return (result);
 }
 
-void telemetry_data_base91 (char *station, char *cdata, char *output)
+void telemetry_data_base91 (char *station, char *cdata, char *output, size_t outputsize)
 {
 	int n;
 	int seq;
@@ -445,7 +465,12 @@ void telemetry_data_base91 (char *station, char *cdata, char *output)
 	dw_printf ("\n%s\n\n", cdata);
 #endif
 
+	strlcpy (output, "", outputsize);
+
 	pm = t_get_metadata(station);
+
+	assert (pm->magic1 == MAGIC1);
+	assert (pm->magic2 == MAGIC2);
 
 	seq = 0;
 	for (n = 0; n < T_NUM_ANALOG; n++) {
@@ -493,7 +518,7 @@ void telemetry_data_base91 (char *station, char *cdata, char *output)
 
 #endif
 
-	t_data_process (pm, seq, araw, ndp, draw, output);
+	t_data_process (pm, seq, araw, ndp, draw, output, outputsize);
 
 } /* end telemtry_data_base91 */
 
@@ -513,7 +538,7 @@ void telemetry_data_base91 (char *station, char *cdata, char *output)
  * Outputs:	Stored for future use when data values are received.
  *
  * Description:	The first 5 characters of the message are "PARM." and the
- *		rest is a variable length list of comma separated names.
+ *		rest is a variable length list of comma separated names.
  *	
  *		The original spec has different maximum lengths for different
  *		fields which we will ignore.
@@ -540,12 +565,18 @@ void telemetry_name_message (char *station, char *msg)
 
 /*
  * Make a copy of the input string because this will alter it.
+ * Remove any trailing CR LF.
  */
 
-	strncpy (stemp, msg, sizeof(stemp));
-	stemp[sizeof(stemp)-1] = '\0';
+	strlcpy (stemp, msg, sizeof(stemp));
+
+	for (p = stemp + strlen(stemp) - 1; p >= stemp && (*p == '\r' || *p == '\n') ; p--) {
+	  *p = '\0';
+	} 
 
 	pm = t_get_metadata(station);
+	assert (pm->magic1 == MAGIC1);
+	assert (pm->magic2 == MAGIC2);
 
 	next = stemp;
 
@@ -553,7 +584,7 @@ void telemetry_name_message (char *station, char *msg)
 	while ((p = strsep(&next,",")) != NULL) {
 	  if (n < T_NUM_ANALOG + T_NUM_DIGITAL) {
 	    if (strlen(p) > 0 && strcmp(p,"-") != 0) {
-	      strncpy (pm->name[n], p, T_STR_LEN-1);
+	      strlcpy (pm->name[n], p, sizeof(pm->name[n]));
 	    }
 	    n++;
 	  }
@@ -586,7 +617,7 @@ void telemetry_name_message (char *station, char *msg)
  * Outputs:	Stored for future use when data values are received.
  *
  * Description:	The first 5 characters of the message are "UNIT." and the
- *		rest is a variable length list of comma separated units/labels.
+ *		rest is a variable length list of comma separated units/labels.
  *	
  *		The original spec has different maximum lengths for different
  *		fields which we will ignore.
@@ -610,12 +641,18 @@ void telemetry_unit_label_message (char *station, char *msg)
 
 /*
  * Make a copy of the input string because this will alter it.
+ * Remove any trailing CR LF.
  */
+	
+	strlcpy (stemp, msg, sizeof(stemp));
 
-	strncpy (stemp, msg, sizeof(stemp));
-	stemp[sizeof(stemp)-1] = '\0';
+	for (p = stemp + strlen(stemp) - 1; p >= stemp && (*p == '\r' || *p == '\n') ; p--) {
+	  *p = '\0';
+	} 
 
 	pm = t_get_metadata(station);
+	assert (pm->magic1 == MAGIC1);
+	assert (pm->magic2 == MAGIC2);
 
 	next = stemp;
 
@@ -623,7 +660,7 @@ void telemetry_unit_label_message (char *station, char *msg)
 	while ((p = strsep(&next,",")) != NULL) {
 	  if (n < T_NUM_ANALOG + T_NUM_DIGITAL) {
 	    if (strlen(p) > 0) {
-	      strncpy (pm->unit[n], p, T_STR_LEN-1);
+	      strlcpy (pm->unit[n], p, sizeof(pm->unit[n]));
 	    }
 	    n++;
 	  }
@@ -657,7 +694,7 @@ void telemetry_unit_label_message (char *station, char *msg)
  * Outputs:	Stored for future use when data values are received.
  *
  * Description:	The first 5 characters of the message are "EQNS." and the
- *		rest is a comma separated list of 15 floating point values.
+ *		rest is a comma separated list of 15 floating point values.
  *	
  *		The spec appears to require all 15 so we will issue an
  *		error if fewer found.
@@ -681,12 +718,18 @@ void telemetry_coefficents_message (char *station, char *msg, int quiet)
 
 /*
  * Make a copy of the input string because this will alter it.
+ * Remove any trailing CR LF.
  */
 
-	strncpy (stemp, msg, sizeof(stemp));
-	stemp[sizeof(stemp)-1] = '\0';
+	strlcpy (stemp, msg, sizeof(stemp));
+
+	for (p = stemp + strlen(stemp) - 1; p >= stemp && (*p == '\r' || *p == '\n') ; p--) {
+	  *p = '\0';
+	} 
 
 	pm = t_get_metadata(station);
+	assert (pm->magic1 == MAGIC1);
+	assert (pm->magic2 == MAGIC2);
 
 	next = stemp;
 
@@ -765,6 +808,8 @@ void telemetry_bit_sense_message (char *station, char *msg, int quiet)
 #endif
 
 	pm = t_get_metadata(station);
+	assert (pm->magic1 == MAGIC1);
+	assert (pm->magic2 == MAGIC2);
 
 	if (strlen(msg) < 8) {
 	  if ( ! quiet) {
@@ -793,7 +838,7 @@ void telemetry_bit_sense_message (char *station, char *msg, int quiet)
 
 	if (msg[n] == ',') n++;
 
-	strncpy (pm->project, msg+n, sizeof(pm->project)-1);
+	strlcpy (pm->project, msg+n, sizeof(pm->project));
  
 #if DEBUG3
 	text_color_set(DW_COLOR_DEBUG);
@@ -831,50 +876,52 @@ void telemetry_bit_sense_message (char *station, char *msg, int quiet)
  * Outputs:	output	- Decoded telemetry in human readable format.
  *
  * Description:	Process raw data according to any metadata available
- *		and put into human readable form.	
+ *		and put into human readable form.
  *		
  *--------------------------------------------------------------------*/
 
-static void fval_to_str (float x, int ndp, char *str)
+#define VAL_STR_SIZE 64
+
+static void fval_to_str (float x, int ndp, char str[VAL_STR_SIZE])
 {
 	if (x == G_UNKNOWN) {
-	  strcpy (str, "?");
+	  strlcpy (str, "?", VAL_STR_SIZE);
 	}
 	else {
-	  sprintf (str, "%.*f", ndp, x);
+	  snprintf (str, VAL_STR_SIZE, "%.*f", ndp, x);
 	}
 }
 
-static void ival_to_str (int x, char *str)
+static void ival_to_str (int x, char str[VAL_STR_SIZE])
 {
 	if (x == G_UNKNOWN) {
-	  strcpy (str, "?");
+	  strlcpy (str, "?", VAL_STR_SIZE);
 	}
 	else {
-	  sprintf (str, "%d", x);
+	  snprintf (str, VAL_STR_SIZE, "%d", x);
 	}
 }
 
-static void t_data_process (struct t_metadata_s *pm, int seq, float araw[T_NUM_ANALOG], int ndp[T_NUM_ANALOG], int draw[T_NUM_DIGITAL], char *output) 
+static void t_data_process (struct t_metadata_s *pm, int seq, float araw[T_NUM_ANALOG], int ndp[T_NUM_ANALOG], int draw[T_NUM_DIGITAL], char *output, size_t outputsize) 
 {
 	int n;
-	char stemp[50];
+	char val_str[VAL_STR_SIZE];
 
 
 	assert (pm != NULL);
 	assert (pm->magic1 == MAGIC1);
 	assert (pm->magic2 == MAGIC2);
 
-	strcpy (output, "");
+	strlcpy (output, "", outputsize);
 
 	if (strlen(pm->project) > 0) {
-	  strcpy (output, pm->project);
-	  strcat (output, ": ");
+	  strlcpy (output, pm->project, outputsize);
+	  strlcat (output, ": ", outputsize);
 	}
 
-	ival_to_str (seq, stemp);
-	strcat (output, "Seq=");
-	strcat (output, stemp);
+	ival_to_str (seq, val_str);
+	strlcat (output, "Seq=", outputsize);
+	strlcat (output, val_str, outputsize);
 	
 	for (n = 0; n < T_NUM_ANALOG; n++) {
 	  
@@ -884,10 +931,10 @@ static void t_data_process (struct t_metadata_s *pm, int seq, float araw[T_NUM_A
 	    float fval;
 	    int fndp;
 
-	    strcat (output, ", ");	
+	    strlcat (output, ", ", outputsize);
 
-	    strcat (output, pm->name[n]);
-	    strcat (output, "=");
+	    strlcat (output, pm->name[n], outputsize);
+	    strlcat (output, "=", outputsize);
 	    
 	    // Scaling and suitable number of decimal places for display.
 
@@ -905,11 +952,11 @@ static void t_data_process (struct t_metadata_s *pm, int seq, float araw[T_NUM_A
 	      z = pm->coeff_ndp[n][C_A] == 0 ? 0 : pm->coeff_ndp[n][C_A] + ndp[n] + ndp[n];
 	      fndp = MAX (z, MAX(pm->coeff_ndp[n][C_B] + ndp[n], pm->coeff_ndp[n][C_C]));
 	    }
-	    fval_to_str (fval, fndp, stemp);
-	    strcat (output, stemp);
+	    fval_to_str (fval, fndp, val_str);
+	    strlcat (output, val_str, outputsize);
 	    if (strlen(pm->unit[n]) > 0) {
-	      strcat (output, " ");
-	      strcat (output, pm->unit[n]);
+	      strlcat (output, " ", outputsize);
+	      strlcat (output, pm->unit[n], outputsize);
 	    }
 	    
 	  }
@@ -922,10 +969,10 @@ static void t_data_process (struct t_metadata_s *pm, int seq, float araw[T_NUM_A
 	  if (draw[n] != G_UNKNOWN) {
 	    int dval;
 
-	    strcat (output, ", ");	
+	    strlcat (output, ", ", outputsize);
 
-	    strcat (output, pm->name[T_NUM_ANALOG+n]);
-	    strcat (output, "=");
+	    strlcat (output, pm->name[T_NUM_ANALOG+n], outputsize);
+	    strlcat (output, "=", outputsize);
 	    
 	    // Possible inverting for bit sense.
 
@@ -936,13 +983,13 @@ static void t_data_process (struct t_metadata_s *pm, int seq, float araw[T_NUM_A
 	      dval = draw[n] ^ ! pm->sense[n];
 	    }
 
-	    ival_to_str (dval , stemp);
+	    ival_to_str (dval, val_str);
 
 	    if (strlen(pm->unit[T_NUM_ANALOG+n]) > 0) {
-	      strcat (output, " ");
-	      strcat (output, pm->unit[T_NUM_ANALOG+n]);
+	      strlcat (output, " ", outputsize);
+	      strlcat (output, pm->unit[T_NUM_ANALOG+n], outputsize);
 	    }
-	    strcat (output, stemp);
+	    strlcat (output, val_str, outputsize);
 	    
 	  }
 	}
@@ -961,7 +1008,8 @@ static void t_data_process (struct t_metadata_s *pm, int seq, float araw[T_NUM_A
  *
  * Unit test.   Run with:
  *
- *	make -f Makefile.? etest
+ *	make  etest
+ *
  *
  *--------------------------------------------------------------------*/
 
@@ -969,14 +1017,14 @@ static void t_data_process (struct t_metadata_s *pm, int seq, float araw[T_NUM_A
 #if TEST
 
 
-
 int main ( )
 {
-	char result[256];
-	char comment[256];
+	char result[120];
+	char comment[40];
+	int errors = 0;
 
-	strcpy (result, "");
-	strcpy (comment, "");
+	strlcpy (result, "", sizeof(result));
+	strlcpy (comment, "", sizeof(comment));
 
 
 	text_color_set(DW_COLOR_INFO);
@@ -989,24 +1037,69 @@ int main ( )
 
 	// From protocol spec.
 
-	telemetry_data_original ("WB2OSZ", "T#005,199,000,255,073,123,01101001", 0, result, comment);
+	telemetry_data_original ("WB2OSZ", "T#005,199,000,255,073,123,01101001", 0, result, sizeof(result), comment, sizeof(comment));
+
+	if (strcmp(result, "Seq=5, A1=199, A2=0, A3=255, A4=73, A5=123, D1=0, D2=1, D3=1, D4=0, D5=1, D6=0, D7=0, D8=1") != 0 ||
+	    strcmp(comment, "") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 101\n");
+	}
 
 	// Try adding a comment.
 
-	telemetry_data_original ("WB2OSZ", "T#005,199,000,255,073,123,01101001Comment,with,commas", 0, result, comment);
-	strcpy (comment, "");
+	telemetry_data_original ("WB2OSZ", "T#005,199,000,255,073,123,01101001Comment,with,commas", 0, result, sizeof(result), comment, sizeof(comment));
 
-	// Try shortening or omitting parts.
+	if (strcmp(result, "Seq=5, A1=199, A2=0, A3=255, A4=73, A5=123, D1=0, D2=1, D3=1, D4=0, D5=1, D6=0, D7=0, D8=1") != 0 ||
+	    strcmp(comment, "Comment,with,commas") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 102\n");
+	}
 
-	telemetry_data_original ("WB2OSZ", "T005,199,000,255,073,123,0110", 0, result, comment);
-	telemetry_data_original ("WB2OSZ", "T#005,199,000,255,073,123,0110", 0, result, comment);
-	telemetry_data_original ("WB2OSZ", "T#005,199,000,255,073,123", 0, result, comment);
-	telemetry_data_original ("WB2OSZ", "T#005,199,000,255,,123,01101001", 0, result, comment);
-	telemetry_data_original ("WB2OSZ", "T#005,199,000,255,073,123,01101009", 0, result, comment);
+
+	// Error handling - Try shortening or omitting parts.
+
+	telemetry_data_original ("WB2OSZ", "T005,199,000,255,073,123,0110", 0, result, sizeof(result), comment, sizeof(comment));
+
+	if (strcmp(result, "") != 0 ||
+	    strcmp(comment, "") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 103\n");
+	}
+
+	telemetry_data_original ("WB2OSZ", "T#005,199,000,255,073,123,0110", 0, result, sizeof(result), comment, sizeof(comment));
+
+	if (strcmp(result, "Seq=5, A1=199, A2=0, A3=255, A4=73, A5=123, D1=0, D2=1, D3=1, D4=0") != 0 ||
+	    strcmp(comment, "") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 104\n");
+	}
+
+	telemetry_data_original ("WB2OSZ", "T#005,199,000,255,073,123", 0, result, sizeof(result), comment, sizeof(comment));
+
+	if (strcmp(result, "Seq=5, A1=199, A2=0, A3=255, A4=73, A5=123") != 0 ||
+	    strcmp(comment, "") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 105\n");
+	}
+
+	telemetry_data_original ("WB2OSZ", "T#005,199,000,255,,123,01101001", 0, result, sizeof(result), comment, sizeof(comment));
+
+	if (strcmp(result, "Seq=5, A1=199, A2=0, A3=255, A5=123, D1=0, D2=1, D3=1, D4=0, D5=1, D6=0, D7=0, D8=1") != 0 ||
+	    strcmp(comment, "") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 106\n");
+	}
+
+	telemetry_data_original ("WB2OSZ", "T#005,199,000,255,073,123,01101009", 0, result, sizeof(result), comment, sizeof(comment));
+
+	if (strcmp(result, "Seq=5, A1=199, A2=0, A3=255, A4=73, A5=123, D1=0, D2=1, D3=1, D4=0, D5=1, D6=0, D7=0") != 0 ||
+	    strcmp(comment, "") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 107\n");
+	}
+
 
 	// Local observation.
 
-	telemetry_data_original ("WB2OSZ", "T#491,4.9,0.3,25.0,0.0,1.0,00000000", 0, result, comment); 
+	telemetry_data_original ("WB2OSZ", "T#491,4.9,0.3,25.0,0.0,1.0,00000000", 0, result, sizeof(result), comment, sizeof(comment));
+
+	if (strcmp(result, "Seq=491, A1=4.9, A2=0.3, A3=25.0, A4=0.0, A5=1.0, D1=0, D2=0, D3=0, D4=0, D5=0, D6=0, D7=0, D8=0") != 0 ||
+	    strcmp(comment, "") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 108\n");
+	}
 
 #endif
 
@@ -1017,42 +1110,186 @@ int main ( )
 
 	// From protocol spec.
 
-	telemetry_data_base91 ("WB2OSZ", "ss11", result);
-	dw_printf ("expect 7544: 1472 above.\n");
+	telemetry_data_base91 ("WB2OSZ", "ss11", result, sizeof(result));
 
-	telemetry_data_base91 ("WB2OSZ", "ss11223344{{!\"", result);
-	dw_printf ("expect 7544: 1472, 1564, 1656, 1748, 8280, 10000000 above.\n");
+	if (strcmp(result, "Seq=7544, A1=1472") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 201\n");	
+	}
+
+	telemetry_data_base91 ("WB2OSZ", "ss11223344{{!\"", result, sizeof(result));
+
+	if (strcmp(result, "Seq=7544, A1=1472, A2=1564, A3=1656, A4=1748, A5=8280, D1=1, D2=0, D3=0, D4=0, D5=0, D6=0, D7=0, D8=0") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 202\n");
+	}
 
 	// Error cases.  Should not happen in practice because function
 	// should be called only with valid data that matches the pattern.
 
-	telemetry_data_base91 ("WB2OSZ", "ss11223344{{!\"x", result);
-	telemetry_data_base91 ("WB2OSZ", "ss1", result);
-	telemetry_data_base91 ("WB2OSZ", "ss11223344{{!", result);
-	telemetry_data_base91 ("WB2OSZ", "s |1", result);
+	telemetry_data_base91 ("WB2OSZ", "ss11223344{{!\"x", result, sizeof(result));
+
+	if (strcmp(result, "") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 203\n");
+	}
+
+	telemetry_data_base91 ("WB2OSZ", "ss1", result, sizeof(result));
+
+	if (strcmp(result, "") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 204\n");
+	}
+
+	telemetry_data_base91 ("WB2OSZ", "ss11223344{{!", result, sizeof(result));
+
+	if (strcmp(result, "") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 205\n");
+	}
+
+	telemetry_data_base91 ("WB2OSZ", "s |1", result, sizeof(result));
+
+	if (strcmp(result, "Seq=?") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 206\n");
+	}
 
 #endif
 
 #if DEBUG3
+
 
 	text_color_set(DW_COLOR_INFO);
 	dw_printf ("part 3\n");	
 
 	telemetry_name_message ("N0QBF-11", "Battery,Btemp,ATemp,Pres,Alt,Camra,Chut,Sun,10m,ATV");
 
+	struct t_metadata_s *pm;
+	pm = t_get_metadata("N0QBF-11");
+
+	if (strcmp(pm->name[0],  "Battery") != 0 ||
+	    strcmp(pm->name[1],  "Btemp") != 0 ||
+	    strcmp(pm->name[2],  "ATemp") != 0 ||
+	    strcmp(pm->name[3],  "Pres") != 0 ||
+	    strcmp(pm->name[4],  "Alt") != 0 ||
+	    strcmp(pm->name[5],  "Camra") != 0 ||
+	    strcmp(pm->name[6],  "Chut") != 0 ||
+	    strcmp(pm->name[7],  "Sun") != 0 ||
+	    strcmp(pm->name[8],  "10m") != 0 ||
+	    strcmp(pm->name[9],  "ATV") != 0 ||
+	    strcmp(pm->name[10], "D6") != 0 ||
+	    strcmp(pm->name[11], "D7") != 0 ||
+	    strcmp(pm->name[12], "D8") != 0 ) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 301\n");
+	}
+
 	telemetry_unit_label_message ("N0QBF-11", "v/100,deg.F,deg.F,Mbar,Kft,Click,OPEN,on,on,hi");
+
+	pm = t_get_metadata("N0QBF-11");
+
+	if (strcmp(pm->unit[0],  "v/100") != 0 ||
+	    strcmp(pm->unit[1],  "deg.F") != 0 ||
+	    strcmp(pm->unit[2],  "deg.F") != 0 ||
+	    strcmp(pm->unit[3],  "Mbar") != 0 ||
+	    strcmp(pm->unit[4],  "Kft") != 0 ||
+	    strcmp(pm->unit[5],  "Click") != 0 ||
+	    strcmp(pm->unit[6],  "OPEN") != 0 ||
+	    strcmp(pm->unit[7],  "on") != 0 ||
+	    strcmp(pm->unit[8],  "on") != 0 ||
+	    strcmp(pm->unit[9],  "hi") != 0 ||
+	    strcmp(pm->unit[10], "") != 0 ||
+	    strcmp(pm->unit[11], "") != 0 ||
+	    strcmp(pm->unit[12], "") != 0 ) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 302\n");
+	}
 
 	telemetry_coefficents_message ("N0QBF-11", "0,5.2,0,0,.53,-32,3,4.39,49,-32,3,18,1,2,3", 0);
 
+	pm = t_get_metadata("N0QBF-11");
+
+	if (pm->coeff[0][0] != 0   || pm->coeff[0][1] < 5.1999 || pm->coeff[0][1] > 5.2001 || pm->coeff[0][2] != 0 ||
+	    pm->coeff[1][0] != 0   || pm->coeff[1][1] < .52999 || pm->coeff[1][1] > .53001 || pm->coeff[1][2] != -32 ||
+	    pm->coeff[2][0] != 3   || pm->coeff[2][1] < 4.3899 || pm->coeff[2][1] > 4.3901 || pm->coeff[2][2] != 49 ||
+	    pm->coeff[3][0] != -32 || pm->coeff[3][1] != 3                                 || pm->coeff[3][2] != 18 ||
+            pm->coeff[4][0] != 1   || pm->coeff[4][1] != 2                                 || pm->coeff[4][2] != 3) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 303c\n");
+	}
+
+	if (pm->coeff_ndp[0][0] != 0 || pm->coeff_ndp[0][1] != 1 || pm->coeff_ndp[0][2] != 0 ||
+	    pm->coeff_ndp[1][0] != 0 || pm->coeff_ndp[1][1] != 2 || pm->coeff_ndp[1][2] != 0 ||
+	    pm->coeff_ndp[2][0] != 0 || pm->coeff_ndp[2][1] != 2 || pm->coeff_ndp[2][2] != 0 ||
+	    pm->coeff_ndp[3][0] != 0 || pm->coeff_ndp[3][1] != 0 || pm->coeff_ndp[3][2] != 0 ||
+	    pm->coeff_ndp[4][0] != 0 || pm->coeff_ndp[4][1] != 0 || pm->coeff_ndp[4][2] != 0 ) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 303n\n");
+	}
+
 	// Error if less than 15 or empty field.
+	// Notice that we keep the previous value in this case.
+
 	telemetry_coefficents_message ("N0QBF-11", "0,5.2,0,0,.53,-32,3,4.39,49,-32,3,18,1,2", 0);
+
+	pm = t_get_metadata("N0QBF-11");
+
+	if (pm->coeff[0][0] != 0   || pm->coeff[0][1] < 5.1999 || pm->coeff[0][1] > 5.2001 || pm->coeff[0][2] != 0 ||
+	    pm->coeff[1][0] != 0   || pm->coeff[1][1] < .52999 || pm->coeff[1][1] > .53001 || pm->coeff[1][2] != -32 ||
+	    pm->coeff[2][0] != 3   || pm->coeff[2][1] < 4.3899 || pm->coeff[2][1] > 4.3901 || pm->coeff[2][2] != 49 ||
+	    pm->coeff[3][0] != -32 || pm->coeff[3][1] != 3                                 || pm->coeff[3][2] != 18 ||
+            pm->coeff[4][0] != 1   || pm->coeff[4][1] != 2                                 || pm->coeff[4][2] != 3) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 304c\n");
+	}
+
+	if (pm->coeff_ndp[0][0] != 0 || pm->coeff_ndp[0][1] != 1 || pm->coeff_ndp[0][2] != 0 ||
+	    pm->coeff_ndp[1][0] != 0 || pm->coeff_ndp[1][1] != 2 || pm->coeff_ndp[1][2] != 0 ||
+	    pm->coeff_ndp[2][0] != 0 || pm->coeff_ndp[2][1] != 2 || pm->coeff_ndp[2][2] != 0 ||
+	    pm->coeff_ndp[3][0] != 0 || pm->coeff_ndp[3][1] != 0 || pm->coeff_ndp[3][2] != 0 ||
+	    pm->coeff_ndp[4][0] != 0 || pm->coeff_ndp[4][1] != 0 || pm->coeff_ndp[4][2] != 0 ) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 304n\n");
+	}
+
 	telemetry_coefficents_message ("N0QBF-11", "0,5.2,0,0,.53,-32,3,4.39,49,-32,3,18,1,,3", 0);
+
+	pm = t_get_metadata("N0QBF-11");
+
+	if (pm->coeff[0][0] != 0   || pm->coeff[0][1] < 5.1999 || pm->coeff[0][1] > 5.2001 || pm->coeff[0][2] != 0 ||
+	    pm->coeff[1][0] != 0   || pm->coeff[1][1] < .52999 || pm->coeff[1][1] > .53001 || pm->coeff[1][2] != -32 ||
+	    pm->coeff[2][0] != 3   || pm->coeff[2][1] < 4.3899 || pm->coeff[2][1] > 4.3901 || pm->coeff[2][2] != 49 ||
+	    pm->coeff[3][0] != -32 || pm->coeff[3][1] != 3                                 || pm->coeff[3][2] != 18 ||
+            pm->coeff[4][0] != 1   || pm->coeff[4][1] != 2                                 || pm->coeff[4][2] != 3) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 305c\n");
+	}
+
+	if (pm->coeff_ndp[0][0] != 0 || pm->coeff_ndp[0][1] != 1 || pm->coeff_ndp[0][2] != 0 ||
+	    pm->coeff_ndp[1][0] != 0 || pm->coeff_ndp[1][1] != 2 || pm->coeff_ndp[1][2] != 0 ||
+	    pm->coeff_ndp[2][0] != 0 || pm->coeff_ndp[2][1] != 2 || pm->coeff_ndp[2][2] != 0 ||
+	    pm->coeff_ndp[3][0] != 0 || pm->coeff_ndp[3][1] != 0 || pm->coeff_ndp[3][2] != 0 ||
+	    pm->coeff_ndp[4][0] != 0 || pm->coeff_ndp[4][1] != 0 || pm->coeff_ndp[4][2] != 0 ) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 305n\n");
+	}
+
 
 	telemetry_bit_sense_message ("N0QBF-11", "10110000,N0QBF's Big Balloon", 0);
 
+	pm = t_get_metadata("N0QBF-11");
+	if (pm->sense[0] != 1 || pm->sense[1] != 0 || pm->sense[2] != 1 || pm->sense[3] != 1 ||
+	    pm->sense[4] != 0 || pm->sense[5] != 0 || pm->sense[6] != 0 || pm->sense[7] != 0 ||
+	    strcmp(pm->project, "N0QBF's Big Balloon") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 306\n");
+	}
+
 	// Too few and invalid digits.
 	telemetry_bit_sense_message ("N0QBF-11", "1011000", 0);
+
+	pm = t_get_metadata("N0QBF-11");
+	if (pm->sense[0] != 1 || pm->sense[1] != 0 || pm->sense[2] != 1 || pm->sense[3] != 1 ||
+	    pm->sense[4] != 0 || pm->sense[5] != 0 || pm->sense[6] != 0 || pm->sense[7] != 0 ||
+	    strcmp(pm->project, "") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 307\n");
+	}
+
 	telemetry_bit_sense_message ("N0QBF-11", "10110008", 0);
+
+	pm = t_get_metadata("N0QBF-11");
+	if (pm->sense[0] != 1 || pm->sense[1] != 0 || pm->sense[2] != 1 || pm->sense[3] != 1 ||
+	    pm->sense[4] != 0 || pm->sense[5] != 0 || pm->sense[6] != 0 || pm->sense[7] != 0 ||
+	    strcmp(pm->project, "") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 308\n");
+	}
+
 
 #endif
 
@@ -1064,15 +1301,46 @@ int main ( )
 	telemetry_name_message ("M0XER-3", "Vbat,Vsolar,Temp,Sat");
 	telemetry_unit_label_message ("M0XER-3", "V,V,C,,m");
 
-	telemetry_data_base91 ("M0XER-3", "DyR.&^<A!.", result);
-	telemetry_data_base91 ("M0XER-3", "cNOv'C?=!-", result);
-	telemetry_data_base91 ("M0XER-3", "n0RS(:>b!+", result);
-	telemetry_data_base91 ("M0XER-3", "x&G=!(8s!,", result);
+	telemetry_data_base91 ("M0XER-3", "DyR.&^<A!.", result, sizeof(result));
+
+	if (strcmp(result, "10mW research balloon: Seq=3273, Vbat=4.472 V, Vsolar=0.516 V, Temp=-24.3 C, Sat=13") != 0 ||
+	    strcmp(comment, "") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 401\n");
+	}
+
+	telemetry_data_base91 ("M0XER-3", "cNOv'C?=!-", result, sizeof(result));
+
+	if (strcmp(result, "10mW research balloon: Seq=6051, Vbat=4.271 V, Vsolar=0.580 V, Temp=2.6 C, Sat=12") != 0 ||
+	    strcmp(comment, "") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 402\n");
+	}
+
+	telemetry_data_base91 ("M0XER-3", "n0RS(:>b!+", result, sizeof(result));
+
+	if (strcmp(result, "10mW research balloon: Seq=7022, Vbat=4.509 V, Vsolar=0.662 V, Temp=-2.8 C, Sat=10") != 0 ||
+	    strcmp(comment, "") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 403\n");
+	}
+
+	telemetry_data_base91 ("M0XER-3", "x&G=!(8s!,", result, sizeof(result));
+
+	if (strcmp(result, "10mW research balloon: Seq=7922, Vbat=3.486 V, Vsolar=0.007 V, Temp=-55.7 C, Sat=11") != 0 ||
+	    strcmp(comment, "") != 0) {
+	  errors++; text_color_set(DW_COLOR_ERROR); dw_printf ("Wrong result, test 404\n");
+	}
 
 
-	// TODO: Should return success/fail so visual inspection is not needed. 
+/* final score. */
 
-	exit (0);
+	if (errors != 0) {
+	  text_color_set (DW_COLOR_ERROR);
+	  dw_printf ("\nTEST FAILED with %d errors.\n", errors);
+	  exit (EXIT_FAILURE);
+	}
+
+	text_color_set (DW_COLOR_REC);
+	dw_printf ("\nTEST WAS SUCCESSFUL.\n");
+	exit (EXIT_SUCCESS);
 }
 
 /*

@@ -73,7 +73,11 @@
 struct packet_s {
 
 	int magic1;		/* for error checking. */
+
 	int seq;		/* unique sequence number for debugging. */
+
+	double release_time;	/* Time stamp in format returned by dtime_now(). */
+				/* When to release from the SATgate mode delay queue. */
 
 #define MAGIC 0x41583235
 
@@ -144,6 +148,8 @@ typedef struct packet_s *packet_t;
 
 
 #ifdef AX25_PAD_C	/* Keep this hidden - implementation could change. */
+
+extern packet_t ax25_new (void);
 
 /*
  * APRS always has one control octet of 0x03 but the more
@@ -236,20 +242,23 @@ typedef enum ax25_modulo_e { modulo_8 = 8, modulo_128 = 128 } ax25_modulo_t;
 typedef enum ax25_frame_type_e {
 
 	frame_type_I,		// Information
-	frame_type_RR,		// Receive Ready - System Ready To Receive
-	frame_type_RNR,		// Receive Not Ready - TNC Buffer Full
-	frame_type_REJ,		// Reject Frame - Out of Sequence or Duplicate
-	frame_type_SREJ,	// Selective Reject - Request single frame repeat
-	frame_type_SABME,	// Set Async Balanced Mode, Extended
-	frame_type_SABM,	// Set Async Balanced Mode
-	frame_type_DISC,	// Disconnect
-	frame_type_DM,		// Disconnect Mode
-	frame_type_UA,		// Unnumbered Acknowledge
-	frame_type_FRMR,	// Frame Reject
-	frame_type_UI,		// Unnumbered Information
-	frame_type_XID,		// Exchange Identification
-	frame_type_TEST,	// Test
+
+	frame_type_S_RR,	// Receive Ready - System Ready To Receive
+	frame_type_S_RNR,	// Receive Not Ready - TNC Buffer Full
+	frame_type_S_REJ,	// Reject Frame - Out of Sequence or Duplicate
+	frame_type_S_SREJ,	// Selective Reject - Request single frame repeat
+
+	frame_type_U_SABME,	// Set Async Balanced Mode, Extended
+	frame_type_U_SABM,	// Set Async Balanced Mode
+	frame_type_U_DISC,	// Disconnect
+	frame_type_U_DM,	// Disconnect Mode
+	frame_type_U_UA,	// Unnumbered Acknowledge
+	frame_type_U_FRMR,	// Frame Reject
+	frame_type_U_UI,	// Unnumbered Information
+	frame_type_U_XID,	// Exchange Identification
+	frame_type_U_TEST,	// Test
 	frame_type_U,		// other Unnumbered, not used by AX.25.
+
 	frame_not_AX25		// Could not get control byte from frame.
 
 } ax25_frame_type_t;
@@ -270,8 +279,10 @@ typedef struct alevel_s {
 } alevel_t;
 
 
+#ifndef AXTEST
+// TODO: remove this?
 #define AX25MEMDEBUG 1
-
+#endif
 
 
 #if AX25MEMDEBUG	// to investigate a memory leak problem
@@ -307,7 +318,10 @@ extern void ax25_delete (packet_t pp);
 #endif
 
 
-extern int ax25_parse_addr (char *in_addr, int strict, char *out_addr, int *out_ssid, int *out_heard);
+
+
+extern int ax25_parse_addr (int position, char *in_addr, int strict, char *out_addr, int *out_ssid, int *out_heard);
+extern int ax25_check_addresses (packet_t pp);
 
 extern packet_t ax25_unwrap_third_party (packet_t from_pp);
 
@@ -318,7 +332,8 @@ extern void ax25_remove_addr (packet_t this_p, int n);
 extern int ax25_get_num_addr (packet_t pp);
 extern int ax25_get_num_repeaters (packet_t this_p);
 
-extern void ax25_get_addr_with_ssid (packet_t pp, int n, char *);
+extern void ax25_get_addr_with_ssid (packet_t pp, int n, char *station);
+extern void ax25_get_addr_no_ssid (packet_t pp, int n, char *station);
 
 extern int ax25_get_ssid (packet_t pp, int n);
 extern void ax25_set_ssid (packet_t this_p, int n, int ssid);
@@ -338,6 +353,9 @@ extern void ax25_set_nextp (packet_t this_p, packet_t next_p);
 extern int ax25_get_dti (packet_t this_p);
 
 extern packet_t ax25_get_nextp (packet_t this_p);
+
+extern void ax25_set_release_time (packet_t this_p, double release_time);
+extern double ax25_get_release_time (packet_t this_p);
 
 extern void ax25_format_addrs (packet_t pp, char *);
 
@@ -360,7 +378,8 @@ extern unsigned short ax25_m_m_crc (packet_t pp);
 
 extern void ax25_safe_print (char *, int, int ascii_only);
 
-extern int ax25_alevel_to_text (alevel_t alevel, char *text);
+#define AX25_ALEVEL_TO_TEXT_SIZE 32	// overkill but safe.
+extern int ax25_alevel_to_text (alevel_t alevel, char text[AX25_ALEVEL_TO_TEXT_SIZE]);
 
 
 #endif /* AX25_PAD_H */

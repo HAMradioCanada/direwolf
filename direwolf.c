@@ -1,7 +1,7 @@
 //
 //    This file is part of Dire Wolf, an amateur radio packet TNC.
 //
-//    Copyright (C) 2011, 2012, 2013, 2014, 2015  John Langner, WB2OSZ
+//    Copyright (C) 2011, 2012, 2013, 2014, 2015, 2016  John Langner, WB2OSZ
 //
 //    This program is free software: you can redistribute it and/or modify
 //    it under the terms of the GNU General Public License as published by
@@ -58,12 +58,17 @@
 #include <sys/ioctl.h>
 #ifdef __OpenBSD__
 #include <soundcard.h>
+#elif __APPLE__
 #else
 #include <sys/soundcard.h>
 #endif
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
+#endif
+
+#if USE_HAMLIB
+#include <hamlib/rig.h>
 #endif
 
 
@@ -100,6 +105,7 @@
 #include "dwgps.h"
 #include "log.h"
 #include "recv.h"
+#include "morse.h"
 
 
 //static int idx_decoded = 0;
@@ -112,7 +118,7 @@ static void cleanup_linux (int);
 
 static void usage (char **argv);
 
-#if __SSE__
+#if defined(__SSE__) && !defined(__APPLE__)
 
 static void __cpuid(int cpuinfo[4], int infotype){
     __asm__ __volatile__ (
@@ -120,7 +126,7 @@ static void __cpuid(int cpuinfo[4], int infotype){
         "=a" (cpuinfo[0]),
         "=b" (cpuinfo[1]),
         "=c" (cpuinfo[2]),
-        "=d" (cpuinfo[3]) :
+        "=d" (cpuinfo[3]):
         "a" (infotype)
     );
 }
@@ -162,7 +168,7 @@ static struct misc_config_s misc_config;
 int main (int argc, char *argv[])
 {
 	int err;
-	int eof;
+	//int eof;
 	int j;
 	char config_file[100];
 	int xmit_calibrate_option = 0;
@@ -175,15 +181,20 @@ int main (int argc, char *argv[])
 	char input_file[80];
 	
 	int t_opt = 1;		/* Text color option. */				
+	int a_opt = 0;		/* "-a n" interval, in seconds, for audio statistics report.  0 for none. */
+
 	int d_k_opt = 0;	/* "-d k" option for serial port KISS.  Can be repeated for more detail. */					
 	int d_n_opt = 0;	/* "-d n" option for Network KISS.  Can be repeated for more detail. */	
 	int d_t_opt = 0;	/* "-d t" option for Tracker.  Can be repeated for more detail. */	
+	int d_g_opt = 0;	/* "-d g" option for GPS. Can be repeated for more detail. */
 	int d_o_opt = 0;	/* "-d o" option for output control such as PTT and DCD. */	
-			
-	
+	int d_i_opt = 0;	/* "-d i" option for IGate.  Repeat for more detail */
+#if USE_HAMLIB
+	int d_h_opt = 0;	/* "-d h" option for hamlib debugging.  Repeat for more detail */
+#endif
 
-	strcpy(l_opt, "");
-	strcpy(P_opt, "");
+	strlcpy(l_opt, "", sizeof(l_opt));
+	strlcpy(P_opt, "", sizeof(P_opt));
 
 #if __WIN32__
 
@@ -196,12 +207,6 @@ int main (int argc, char *argv[])
 	//Restore on exit? oldcp = GetConsoleOutputCP();
 	SetConsoleOutputCP(CP_UTF8);
 
-#elif __CYGWIN__
-
-/*
- * Without this, the ISO Latin 1 characters are displayed as gray boxes.
- */
-	//setenv ("LANG", "C.ISO-8859-1", 1);
 #else
 
 /*
@@ -226,17 +231,29 @@ int main (int argc, char *argv[])
 	  }
 	}
 
-	// TODO: control development/beta/release by versio.h instead of changing here.
+	// TODO: control development/beta/release by version.h instead of changing here.
+	// Print platform.  This will provide more information when people send a copy the information displayed.
 
 	text_color_init(t_opt);
 	text_color_set(DW_COLOR_INFO);
 	//dw_printf ("Dire Wolf version %d.%d (%s) Beta Test\n", MAJOR_VERSION, MINOR_VERSION, __DATE__);
-	//dw_printf ("Dire Wolf DEVELOPMENT version %d.%d %s (%s)\n", MAJOR_VERSION, MINOR_VERSION, "F", __DATE__);
+	//dw_printf ("Dire Wolf DEVELOPMENT version %d.%d %s (%s)\n", MAJOR_VERSION, MINOR_VERSION, "K", __DATE__);
 	dw_printf ("Dire Wolf version %d.%d\n", MAJOR_VERSION, MINOR_VERSION);
+
+#if defined(ENABLE_GPSD) || defined(USE_HAMLIB)
+	dw_printf ("Includes optional support for: ");
+#if defined(ENABLE_GPSD)
+	dw_printf (" gpsd");
+#endif
+#if defined(USE_HAMLIB)
+	dw_printf (" hamlib");
+#endif
+	dw_printf ("\n");
+#endif
 
 
 #if __WIN32__
-	SetConsoleCtrlHandler (cleanup_win, TRUE);
+	SetConsoleCtrlHandler ((PHANDLER_ROUTINE)cleanup_win, TRUE);
 #else
 	setlinebuf (stdout);
 	signal (SIGINT, cleanup_linux);
@@ -250,10 +267,13 @@ int main (int argc, char *argv[])
  * Try to warn anyone using a CPU from the previous
  * century rather than just dying for no apparent reason.
  *
+ * Apple computers with Intel processors started with P6. Since the
+ * cpu test code was giving Clang compiler grief it has been excluded.
+ *
  * Now, where can I find a Pentium 2 or earlier to test this?
  */
 
-#if __SSE__
+#if defined(__SSE__) && !defined(__APPLE__)
 	int cpuinfo[4];
 	__cpuid (cpuinfo, 0);
 	if (cpuinfo[0] >= 1) {
@@ -272,19 +292,7 @@ int main (int argc, char *argv[])
 	text_color_set(DW_COLOR_INFO);
 #endif
 
-/*
- * This has not been very well tested in 64 bit mode.
- */
 
-#if 0
-	if (sizeof(int) != 4 || sizeof(long) != 4 || sizeof(char *) != 4) {
-	    text_color_set(DW_COLOR_ERROR);
-	    dw_printf ("------------------------------------------------------------------\n");
-	    dw_printf ("This might not work properly when compiled for a 64 bit target.\n");
-	    dw_printf ("It is recommended that you rebuild it with gcc -m32 option.\n");
-	    dw_printf ("------------------------------------------------------------------\n");
-	}
-#endif
 
 /*
  * Default location of configuration file is current directory.
@@ -292,16 +300,16 @@ int main (int argc, char *argv[])
  * TODO:  Automatically search other places.
  */
 	
-	strcpy (config_file, "direwolf.conf");
+	strlcpy (config_file, "direwolf.conf", sizeof(config_file));
 
 /*
  * Look at command line options.
  * So far, the only one is the configuration file location.
  */
 
-	strcpy (input_file, "");
+	strlcpy (input_file, "", sizeof(input_file));
 	while (1) {
-          int this_option_optind = optind ? optind : 1;
+          //int this_option_optind = optind ? optind : 1;
           int option_index = 0;
 	  int c;
 	  char *p;
@@ -314,7 +322,7 @@ int main (int argc, char *argv[])
 
 	  /* ':' following option character means arg is required. */
 
-          c = getopt_long(argc, argv, "P:B:D:c:pxr:b:n:d:q:t:Ul:",
+          c = getopt_long(argc, argv, "P:B:D:c:pxr:b:n:d:q:t:Ul:Sa:",
                         long_options, &option_index);
           if (c == -1)
             break;
@@ -330,10 +338,19 @@ int main (int argc, char *argv[])
             dw_printf("\n");
             break;
 
+          case 'a':				/* -a for audio statistics interval */
+
+	    a_opt = atoi(optarg);
+	    if (a_opt < 0) a_opt = 0;
+	    if (a_opt < 10) {
+	      text_color_set(DW_COLOR_ERROR);
+              dw_printf("Setting such a small audio statistics interval will produce inaccurate sample rate display.\n");
+   	    }
+            break;
 
           case 'c':				/* -c for configuration file name */
 
-	    strcpy (config_file, optarg);
+	    strlcpy (config_file, optarg, sizeof(config_file));
             break;
 
 #if __WIN32__
@@ -360,7 +377,7 @@ int main (int argc, char *argv[])
 	  case 'P':				/* -P for modem profile. */
 
 	    //debug: dw_printf ("Demodulator profile set to \"%s\"\n", optarg);
-	    strcpy (P_opt, optarg); 
+	    strlcpy (P_opt, optarg, sizeof(P_opt)); 
 	    break;	
 
           case 'D':				/* -D decrease AFSK demodulator sample rate */
@@ -433,13 +450,18 @@ int main (int argc, char *argv[])
 
 		// separate out gps & waypoints.
 
+	      case 'g':  d_g_opt++; break;
 	      case 't':  d_t_opt++; beacon_tracker_set_debug (d_t_opt); break;
 
 	      case 'w':	 nmea_set_debug (1); break;		// not documented yet.
 	      case 'p':  d_p_opt = 1; break;			// TODO: packet dump for xmit side.
 	      case 'o':  d_o_opt++; ptt_set_debug(d_o_opt); break;	
+	      case 'i':  d_i_opt++; break;
 #if AX25MEMDEBUG
 	      case 'm':  ax25memdebug_set(); break;		// Track down memory leak.  Not documented.		
+#endif
+#if USE_HAMLIB
+	      case 'h':  d_h_opt++; break;			// Hamlib verbose level.
 #endif
 	      default: break;
 	     }
@@ -476,8 +498,15 @@ int main (int argc, char *argv[])
 
           case 'l':				/* -l for log file directory name */
 
-	    strncpy (l_opt, optarg, sizeof(l_opt)-1);
+	    strlcpy (l_opt, optarg, sizeof(l_opt));
             break;
+
+	  case 'S':				/* Print symbol tables and exit. */
+
+	    symbols_init ();
+	    symbols_list ();
+	    exit (0);
+	    break;
 
           default:
 
@@ -497,7 +526,7 @@ int main (int argc, char *argv[])
             dw_printf ("Warning: File(s) beyond the first are ignored.\n");
           }
 
-	  strcpy (input_file, argv[optind]);
+	  strlcpy (input_file, argv[optind], sizeof(input_file));
 
 	}
 
@@ -506,6 +535,10 @@ int main (int argc, char *argv[])
  *
  * Possibly override some by command line options.
  */
+
+#if USE_HAMLIB
+        rig_set_debug(d_h_opt);
+#endif
 
 	symbols_init ();
 
@@ -544,10 +577,12 @@ int main (int argc, char *argv[])
 	  }
 	}
 
+	audio_config.statistics_interval = a_opt;
+
 	if (strlen(P_opt) > 0) { 
 	  /* -P for modem profile. */
 	  /* TODO: Not yet documented.  Should probably since it is consistent with atest. */
-	  strcpy (audio_config.achan[0].profiles, P_opt); 
+	  strlcpy (audio_config.achan[0].profiles, P_opt, sizeof(audio_config.achan[0].profiles)); 
 	}	
 
 	if (D_opt != 0) {
@@ -556,14 +591,17 @@ int main (int argc, char *argv[])
 	}
 
 	if (strlen(l_opt) > 0) {
-	  strncpy (misc_config.logdir, l_opt, sizeof(misc_config.logdir)-1);
+	  strlcpy (misc_config.logdir, l_opt, sizeof(misc_config.logdir));
 	}
 
 	misc_config.enable_kiss_pt = enable_pseudo_terminal;
 
 	if (strlen(input_file) > 0) {
-	  strcpy (audio_config.adev[0].adevice_in, input_file);
+
+	  strlcpy (audio_config.adev[0].adevice_in, input_file, sizeof(audio_config.adev[0].adevice_in));
+
 	}
+
 
 /*
  * Open the audio source 
@@ -600,6 +638,7 @@ int main (int argc, char *argv[])
  * It is the range of the digital sound representation.
 */
 	gen_tone_init (&audio_config, 100);
+	morse_init (&audio_config, 100);
 
 	assert (audio_config.adev[0].bits_per_sample == 8 || audio_config.adev[0].bits_per_sample == 16);
 	assert (audio_config.adev[0].num_channels == 1 || audio_config.adev[0].num_channels == 2);
@@ -640,7 +679,7 @@ int main (int argc, char *argv[])
  * Initialize the digipeater and IGate functions.
  */
 	digipeater_init (&audio_config, &digi_config);
-	igate_init (&audio_config, &igate_config, &digi_config);
+	igate_init (&audio_config, &igate_config, &digi_config, d_i_opt);
 
 /*
  * Provide the AGW & KISS socket interfaces for use by a client application.
@@ -657,7 +696,9 @@ int main (int argc, char *argv[])
 /*
  * Open port for communication with GPS.
  */
-	nmea_init (&misc_config);
+	dwgps_init (&misc_config, d_g_opt);
+
+	nmea_init (&misc_config);  //  TODO: revisit.
 
 /* 
  * Create thread for trying to salvage frames with bad FCS.
@@ -666,17 +707,18 @@ int main (int argc, char *argv[])
 
 /*
  * Enable beaconing.
+ * Open log file first because "-dttt" (along with -l...) will
+ * log the tracker beacon transmissions with fake channel 999.
  */
-	beacon_init (&audio_config, &misc_config, &digi_config);
 
+	log_init(misc_config.logdir);
+	beacon_init (&audio_config, &misc_config);
 
-	log_init(misc_config.logdir);	
 
 /*
  * Get sound samples and decode them.
  * Use hot attribute for all functions called for every audio sample.
  */
-
 
 	recv_init (&audio_config);
 	recv_process ();
@@ -695,6 +737,7 @@ int main (int argc, char *argv[])
  * Inputs:	chan	- Audio channel number, 0 or 1.
  *		subchan	- Which modem caught it.  
  *			  Special case -1 for DTMF decoder.
+ *		slice	- Slicer which caught it.
  *		pp	- Packet handle.
  *		alevel	- Audio level, range of 0 - 100.
  *				(Special case, use negative to skip
@@ -711,8 +754,7 @@ int main (int argc, char *argv[])
 
 // TODO:  Use only one printf per line so output doesn't get jumbled up with stuff from other threads.
 
-
-void app_process_rec_packet (int chan, int subchan, packet_t pp, alevel_t alevel, retry_t retries, char *spectrum)  
+void app_process_rec_packet (int chan, int subchan, int slice, packet_t pp, alevel_t alevel, retry_t retries, char *spectrum)
 {	
 	
 	char stemp[500];
@@ -725,11 +767,12 @@ void app_process_rec_packet (int chan, int subchan, packet_t pp, alevel_t alevel
 
 	assert (chan >= 0 && chan < MAX_CHANS);
 	assert (subchan >= -1 && subchan < MAX_SUBCHANS);
+	assert (slice >= 0 && slice < MAX_SLICERS);
 	assert (pp != NULL);	// 1.1J+
      
-	strcpy (display_retries, "");
+	strlcpy (display_retries, "", sizeof(display_retries));
 	if (audio_config.achan[chan].fix_bits != RETRY_NONE || audio_config.achan[chan].passall) {
-	  sprintf (display_retries, " [%s] ", retry_text[(int)retries]);
+	  snprintf (display_retries, sizeof(display_retries), " [%s] ", retry_text[(int)retries]);
 	}
 
 	ax25_format_addrs (pp, stemp);
@@ -744,7 +787,7 @@ void app_process_rec_packet (int chan, int subchan, packet_t pp, alevel_t alevel
 	if (ax25_get_num_addr(pp) == 0) {
 	  /* Not AX.25. No station to display below. */
 	  h = -1;
-	  strcpy (heard, "");
+	  strlcpy (heard, "", sizeof(heard));
 	}
 	else {
 	  h = ax25_get_heard(pp);
@@ -760,7 +803,7 @@ void app_process_rec_packet (int chan, int subchan, packet_t pp, alevel_t alevel
 	    dw_printf ("Digipeater ");
 	  }
 
-	  char alevel_text[32];
+	  char alevel_text[AX25_ALEVEL_TO_TEXT_SIZE];
 
 	  ax25_alevel_to_text (alevel, alevel_text);
 
@@ -781,6 +824,10 @@ void app_process_rec_packet (int chan, int subchan, packet_t pp, alevel_t alevel
 
 	    dw_printf ("%s (probably %s) audio level = %s  %s  %s\n", heard, probably_really, alevel_text, display_retries, spectrum);
 
+	  }
+	  else if (strcmp(heard, "DTMF") == 0) {
+
+	    dw_printf ("%s audio level = %s  tt\n", heard, alevel_text);
 	  }
 	  else {
 
@@ -818,8 +865,15 @@ void app_process_rec_packet (int chan, int subchan, packet_t pp, alevel_t alevel
 	  else {
 	    text_color_set(DW_COLOR_DEBUG);
 	  }
-	  if (audio_config.achan[chan].num_subchan > 1) {
+
+	  if (audio_config.achan[chan].num_subchan > 1 && audio_config.achan[chan].num_slicers == 1) {
 	    dw_printf ("[%d.%d] ", chan, subchan);
+	  }
+	  else if (audio_config.achan[chan].num_subchan == 1 && audio_config.achan[chan].num_slicers > 1) {
+	    dw_printf ("[%d.%d] ", chan, slice);
+	  }
+	  else if (audio_config.achan[chan].num_subchan > 1 && audio_config.achan[chan].num_slicers > 1) {
+	    dw_printf ("[%d.%d.%d] ", chan, subchan, slice);
 	  }
 	  else {
 	    dw_printf ("[%d] ", chan);
@@ -879,6 +933,12 @@ void app_process_rec_packet (int chan, int subchan, packet_t pp, alevel_t alevel
 
 	  decode_aprs_print (&A);
 
+	  /*
+	   * Perform validity check on each address.
+	   * This should print an error message if any issues.
+	   */
+	  (void)ax25_check_addresses(pp);
+
 	  // Send to log file.
 
 	  log_write (chan, &A, pp, alevel, retries);
@@ -888,13 +948,14 @@ void app_process_rec_packet (int chan, int subchan, packet_t pp, alevel_t alevel
  	  if (A.g_lat != G_UNKNOWN && A.g_lon != G_UNKNOWN) {
 	    nmea_send_waypoint (strlen(A.g_name) > 0 ? A.g_name : A.g_src, 
 		A.g_lat, A.g_lon, A.g_symbol_table, A.g_symbol_code, 
-		DW_FEET_TO_METERS(A.g_altitude), A.g_course, DW_MPH_TO_KNOTS(A.g_speed), 
+		DW_FEET_TO_METERS(A.g_altitude_ft), A.g_course, DW_MPH_TO_KNOTS(A.g_speed_mph), 
 		A.g_comment);
 	  }
 	}
 
 
 /* Send to another application if connected. */
+// TODO1.3:  Put a wrapper around this so we only call one function to send by all methods.
 
 	int flen;
 	unsigned char fbuf[AX25_MAX_PACKET_LEN];
@@ -914,7 +975,7 @@ void app_process_rec_packet (int chan, int subchan, packet_t pp, alevel_t alevel
  */
 	if (subchan == -1) {
 	  if (tt_config.gateway_enabled && info_len >= 2) {
-	    aprs_tt_sequence (chan, pinfo+1);
+	    aprs_tt_sequence (chan, (char*)(pinfo+1));
 	  }
 	}
 	else { 
@@ -924,23 +985,20 @@ void app_process_rec_packet (int chan, int subchan, packet_t pp, alevel_t alevel
 
 	  if (ax25_is_aprs(pp) && retries == RETRY_NONE) {
 
-	    if (digi_config.filter_str[chan][MAX_CHANS] != NULL) {
-
-// TODO1.2: filtering  - maybe it should be ig... so we don't waste time filtering if igate not used.
-
-	    }
-	    else {
-	      igate_send_rec_packet (chan, pp);
-	    }
+	    igate_send_rec_packet (chan, pp);
 	  }
 
+
 /* Send out a regenerated copy. Applies to all types, not just APRS. */
+/* This was an experimental feature never documented in the User Guide. */
+/* Initial feedback was positive but it fell by the wayside. */
+/* Should follow up with testers and either document this or clean out the clutter. */
 
 	  digi_regen (chan, pp);
 
 
 /* 
- *Note that the digipeater function can modify the packet in place so 
+ * Note that the digipeater function can modify the packet in place so 
  * this is the last thing we should do with it. 
  * Again, use only those with correct CRC; We don't want to spread corrupted data!
  * Single bit change appears to be safe from observations so far but be cautious. 
@@ -1000,7 +1058,7 @@ static void usage (char **argv)
 	dw_printf ("\n");
 	dw_printf ("Dire Wolf version %d.%d\n", MAJOR_VERSION, MINOR_VERSION);
 	dw_printf ("\n");
-	dw_printf ("Usage: direwolf [options]\n");
+	dw_printf ("Usage: direwolf [options] [ - | stdin | UDP:nnnn ]\n");
 	dw_printf ("Options:\n");
 	dw_printf ("    -c fname       Configuration file name.\n");
 	dw_printf ("    -l logdir      Directory name for log files.  Use . for current.\n");
@@ -1018,20 +1076,31 @@ static void usage (char **argv)
 	dw_printf ("       n             n = KISS network client.\n");
 	dw_printf ("       u             u = Display non-ASCII text in hexadecimal.\n");
 	dw_printf ("       p             p = dump Packets in hexadecimal.\n");
-	dw_printf ("       t             t = gps Tracker.\n");
+	dw_printf ("       g             g = GPS interface.\n");
+	dw_printf ("       t             t = Tracker beacon.\n");
 	dw_printf ("       o             o = output controls such as PTT and DCD.\n");
+	dw_printf ("       i             i = IGate.\n");
+#if USE_HAMLIB
+	dw_printf ("       h             h = hamlib increase verbose level.\n");
+#endif
 	dw_printf ("    -q             Quiet (suppress output) options:\n");
 	dw_printf ("       h             h = Heard line with the audio level.\n");
 	dw_printf ("       d             d = Decoding of APRS packets.\n");
 	dw_printf ("    -t n           Text colors.  1=normal, 0=disabled.\n");
+	dw_printf ("    -a n           Audio statistics interval in seconds.  0 to disable.\n");
 #if __WIN32__
 #else
 	dw_printf ("    -p             Enable pseudo terminal for KISS protocol.\n");
 #endif
 	dw_printf ("    -x             Send Xmit level calibration tones.\n");
 	dw_printf ("    -U             Print UTF-8 test string and exit.\n");
+	dw_printf ("    -S             Print symbol tables and exit.\n");
 	dw_printf ("\n");
 
+	dw_printf ("After any options, there can be a single command line argument for the source of\n");
+	dw_printf ("received audio.  This can overrides the audio input specified in the configuration file.\n");
+	dw_printf ("\n");
+  
 #if __WIN32__
 #else
 	dw_printf ("Complete documentation can be found in /usr/local/share/doc/direwolf.\n");

@@ -288,7 +288,6 @@ int gen_tone_init (struct audio_s *audio_config_p, int amp)
  *
  *--------------------------------------------------------------------*/
 
-static void put_sample (int chan, int a, int sam);
 
 void tone_gen_put_bit (int chan, int dat)
 {
@@ -319,7 +318,7 @@ void tone_gen_put_bit (int chan, int dat)
 
 	    tone_phase[chan] += dat ? f2_change_per_sample[chan] : f1_change_per_sample[chan];
             sam = sine_table[(tone_phase[chan] >> 24) & 0xff];
-	    put_sample (chan, a, sam);
+	    gen_tone_put_sample (chan, a, sam);
 	  }
   	  else {
 	    
@@ -335,7 +334,7 @@ void tone_gen_put_bit (int chan, int dat)
 
 	      sam = (int) convolve (raw[chan], lp_filter[chan], lp_filter_size[chan]);
 	      resample[chan] = 0;
-	      put_sample (chan, a, sam);
+	      gen_tone_put_sample (chan, a, sam);
 	    }
 	  }
 
@@ -349,7 +348,7 @@ void tone_gen_put_bit (int chan, int dat)
 }
 
 
-static void put_sample (int chan, int a, int sam) {
+void gen_tone_put_sample (int chan, int a, int sam) {
 
         /* Ship out an audio sample. */
 
@@ -427,8 +426,8 @@ int main ()
 /* one channel.  2 times:  one second of each tone. */
 
 	memset (&my_audio_config, 0, sizeof(my_audio_config));
-	strcpy (my_audio_config.adev[0].adevice_in, DEFAULT_ADEVICE);
-	strcpy (my_audio_config.adev[0].adevice_out, DEFAULT_ADEVICE);
+	strlcpy (my_audio_config.adev[0].adevice_in, DEFAULT_ADEVICE, sizeof(my_audio_config.adev[0].adevice_in));
+	strlcpy (my_audio_config.adev[0].adevice_out, DEFAULT_ADEVICE, sizeof(my_audio_config.adev[0].adevice_out));
 
 	audio_open (&my_audio_config);
 	gen_tone_init (&my_audio_config, 100);
@@ -449,8 +448,8 @@ int main ()
 /* Now try stereo. */
 
 	memset (&my_audio_config, 0, sizeof(my_audio_config));
-	strcpy (my_audio_config.adev[0].adevice_in, DEFAULT_ADEVICE);
-	strcpy (my_audio_config.adev[0].adevice_out, DEFAULT_ADEVICE);
+	strlcpy (my_audio_config.adev[0].adevice_in, DEFAULT_ADEVICE, sizeof(my_audio_config.adev[0].adevice_in));
+	strlcpy (my_audio_config.adev[0].adevice_out, DEFAULT_ADEVICE, , sizeof(my_audio_config.adev[0].adevice_out));
 	my_audio_config.adev[0].num_channels = 2;
 
 	audio_open (&my_audio_config);

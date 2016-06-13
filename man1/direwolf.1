@@ -77,9 +77,15 @@ u = Display non-ASCII text in hexadecimal.
 .P
 p = Packet dump in hexadecimal.
 .P
-t = GPS Tracker.
+g = GPS interface.
+.P
+t = Tracker beacon.
 .P
 o = Output controls such as PTT and DCD.
+.P
+i = IGate
+.P
+h = Hamlib verbose level.  Repeat for more.
 .RE
 .RE
 .PD
@@ -112,6 +118,14 @@ Send Xmit level calibration tones.
 .TP
 .B "-U " 
 Print UTF-8 test string and exit.
+
+.TP
+.B "-S " 
+Print Symbol tables and exit.
+
+.TP
+.BI "-a " "n"
+Report audio device statistics each n seconds.
 
 
 .SH EXAMPLES

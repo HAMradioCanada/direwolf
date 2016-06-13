@@ -3,7 +3,6 @@
 #define DIREWOLF_H 1
 
 
-
 /*
  * Previously, we could handle only a single audio device.
  * This meant we could have only two radio channels.
@@ -32,6 +31,14 @@
 #define MAX_CHANS ((MAX_ADEVS) * 2)
 
 /*
+ * Maximum number of rigs.
+ */
+
+#ifdef USE_HAMLIB
+#define MAX_RIGS MAX_CHANS
+#endif
+
+/*
  * Get audio device number for given channel.
  * and first channel for given device.
  */
@@ -49,6 +56,17 @@
 
 #define MAX_SUBCHANS 9
 
+/*
+ * Each one of these can have multiple slicers, at
+ * different levels, to compensate for different
+ * amplitudes of the AFSK tones.
+ * Intially used same number as subchannels but
+ * we could probably trim this down a little
+ * without impacting performance.
+ */
+
+#define MAX_SLICERS 9
+
 
 #if __WIN32__
 #include <windows.h>
@@ -62,7 +80,10 @@
 
 #if __WIN32__
 #define PTW32_STATIC_LIB
-#include "pthreads/pthread.h"
+//#include "pthreads/pthread.h"
+#define gmtime_r( _clock, _result ) \
+        ( *(_result) = *gmtime( (_clock) ), \
+          (_result) )
 #else
 #include <pthread.h>
 #endif
@@ -71,6 +92,10 @@
 /* Not sure where to put these. */
 
 /* Prefix with DW_ because /usr/include/gps.h uses a couple of these names. */
+
+#ifndef G_UNKNOWN
+#include "latlong.h"
+#endif
 
 
 #define DW_METERS_TO_FEET(x) ((x) == G_UNKNOWN ? G_UNKNOWN : (x) * 3.2808399)
@@ -153,9 +178,52 @@ typedef pthread_mutex_t dw_mutex_t;
 	  } \
 	}
 
-
 #endif
 
+
+
+/* Platform differences for string functions. */
+
+
+
+#if __WIN32__
+char *strsep(char **stringp, const char *delim);
+char *strtok_r(char *str, const char *delim, char **saveptr);
+#endif
+
+//#if __WIN32__
+char *strcasestr(const char *S, const char *FIND);
+//#endif
+
+
+#if defined(__OpenBSD__) || defined(__FreeBSD__) || defined(__APPLE__)
+
+// strlcpy and strlcat should be in string.h and the C library.
+
+#else   // Use our own copy
+
+
+#define DEBUG_STRL 1
+
+#if DEBUG_STRL
+
+#define strlcpy(dst,src,siz) strlcpy_debug(dst,src,siz,__FILE__,__func__,__LINE__)
+#define strlcat(dst,src,siz) strlcat_debug(dst,src,siz,__FILE__,__func__,__LINE__)
+
+size_t strlcpy_debug(char *__restrict__ dst, const char *__restrict__ src, size_t siz, const char *file, const char *func, int line);
+size_t strlcat_debug(char *__restrict__ dst, const char *__restrict__ src, size_t siz, const char *file, const char *func, int line);
+
+#else
+
+#define strlcpy(dst,src,siz) strlcpy_debug(dst,src,siz)
+#define strlcat(dst,src,siz) strlcat_debug(dst,src,siz)
+
+size_t strlcpy_debug(char *__restrict__ dst, const char *__restrict__ src, size_t siz);
+size_t strlcat_debug(char *__restrict__ dst, const char *__restrict__ src, size_t siz);
+
+#endif  /* DEBUG_STRL */
+
+#endif	/* BSD or Apple */
 
 
 #endif   /* ifndef DIREWOLF_H */

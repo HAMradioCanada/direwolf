@@ -275,7 +275,7 @@ static void * connect_listen_thread (void *arg)
 	SOCKET listen_sock;  
 	WSADATA wsadata;
 
-	sprintf (kiss_port_str, "%d", (int)(long)arg);
+	snprintf (kiss_port_str, sizeof(kiss_port_str), "%d", (int)(long)arg);
 #if DEBUG
 	text_color_set(DW_COLOR_DEBUG);
         dw_printf ("DEBUG: kissnet port = %d = '%s'\n", (int)(long)arg, kiss_port_str);
@@ -382,6 +382,7 @@ static void * connect_listen_thread (void *arg)
     	socklen_t sockaddr_size = sizeof(struct sockaddr_in);
 	int kiss_port = (int)(long)arg;
 	int listen_sock;  
+	int bcopt = 1;
 
 	listen_sock= socket(AF_INET,SOCK_STREAM,0);
 	if (listen_sock == -1) {
@@ -389,6 +390,14 @@ static void * connect_listen_thread (void *arg)
 	  perror ("connect_listen_thread: Socket creation failed");
 	  return (NULL);
 	}
+
+	/* Version 1.3 - as suggested by G8BPQ. */
+	/* Without this, if you kill the application then try to run it */
+	/* again quickly the port number is unavailable for a while. */
+	/* Don't try doing the same thing On Windows; It has a different meaning. */
+	/* http://stackoverflow.com/questions/14388706/socket-options-so-reuseaddr-and-so-reuseport-how-do-they-differ-do-they-mean-t */
+
+        setsockopt (listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&bcopt, 4);
 
     	sockaddr.sin_addr.s_addr = INADDR_ANY;
     	sockaddr.sin_port = htons(kiss_port);
@@ -484,7 +493,7 @@ void kissnet_send_rec_packet (int chan, unsigned char *fbuf, int flen)
 	  if (kiss_debug) {
 	    kiss_debug_print (TO_CLIENT, "Fake command prompt", fbuf, flen);
 	  }
-	  strcpy ((char *)kiss_buff, (char *)fbuf);
+	  strlcpy ((char *)kiss_buff, (char *)fbuf, sizeof(kiss_buff));
 	  kiss_len = strlen((char *)kiss_buff);
 	}
 	else {
@@ -502,7 +511,7 @@ void kissnet_send_rec_packet (int chan, unsigned char *fbuf, int flen)
 	    text_color_set(DW_COLOR_DEBUG);
 	    dw_printf ("\n");
 	    dw_printf ("Packet content before adding KISS framing and any escapes:\n");
-	    hex_dump ((char*)fbuf, flen);
+	    hex_dump (fbuf, flen);
 	  }
 
 	  kiss_len = kiss_encapsulate (stemp, flen+1, kiss_buff);

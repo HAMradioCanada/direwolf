@@ -1,5 +1,5 @@
 
-
+#include "direwolf.h"
 #include "textcolor.h"
 #include "dtime_now.h"
 
@@ -13,9 +13,11 @@
 
 #include <time.h>
 
-#if __WIN32__
-#include <windows.h>
+#ifdef __APPLE__
+#include <sys/time.h>
 #endif
+
+
 
 
 
@@ -37,7 +39,14 @@ double dtime_now (void)
 
 	struct timespec ts;
 
+#ifdef __APPLE__
+	struct timeval tp;
+	gettimeofday(&tp, NULL);
+	ts.tv_nsec = tp.tv_usec * 1000;
+	ts.tv_sec  = tp.tv_sec;
+#else
 	clock_gettime (CLOCK_REALTIME, &ts);
+#endif
 
 	result = ((double)(ts.tv_sec) + (double)(ts.tv_nsec) * 0.000000001);
 	

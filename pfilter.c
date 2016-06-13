@@ -1,7 +1,7 @@
 //
 //    This file is part of Dire Wolf, an amateur radio packet TNC.
 //
-//    Copyright (C) 2015  John Langner, WB2OSZ
+//    Copyright (C) 2015, 2016  John Langner, WB2OSZ
 //
 //    This program is free software: you can redistribute it and/or modify
 //    it under the terms of the GNU General Public License as published by
@@ -133,7 +133,7 @@ static int filt_s (pfstate_t *pf);
  *				Both are 0 .. MAX_CHANS-1 or MAX_CHANS for IGate.  
  *			 	For debug/error messages only.
  *
- *		filter	- Filter specs and logical operators to combine them.
+ *		filter	- String of filter specs and logical operators to combine them.
  *
  *		pp	- Packet object handle.
  *
@@ -152,12 +152,28 @@ int pfilter (int from_chan, int to_chan, char *filter, packet_t pp)
 	char *p;
 	int result;
 
+	assert (from_chan >= 0 && from_chan <= MAX_CHANS);
+	assert (to_chan >= 0 && to_chan <= MAX_CHANS);
+
+	if (pp == NULL) {
+	  text_color_set(DW_COLOR_DEBUG);
+	  dw_printf ("INTERNAL ERROR in pfilter: NULL packet pointer. Please report this!\n");
+	  return (-1);
+	}
+	if (filter == NULL) {
+	  text_color_set(DW_COLOR_DEBUG);
+	  dw_printf ("INTERNAL ERROR in pfilter: NULL filter string pointer. Please report this!\n");
+	  return (-1);
+	}
+
 	pfstate.from_chan = from_chan;
 	pfstate.to_chan = to_chan;
 
 	/* Copy filter string, removing any control characters. */
+
+	memset (pfstate.filter_str, 0, sizeof(pfstate.filter_str));
 	strncpy (pfstate.filter_str, filter, MAX_FILTER_LEN-1);
-	pfstate.filter_str[MAX_FILTER_LEN-1] = '\0';
+
 	pfstate.nexti = 0;
 	for (p = pfstate.filter_str; *p != '\0'; p++) {
 	  if (iscntrl(*p)) {
@@ -206,11 +222,11 @@ int pfilter (int from_chan, int to_chan, char *filter, packet_t pp)
  *		Note that a filter-spec must be followed by space or 
  *		end of line.  This is so the magic characters can appear in one.
  *
- * Future:	Allow words like 'OR' as alternatives to symbols like '|'.
+ * Future:	Maybe allow words like 'OR' as alternatives to symbols like '|'.
  *
  * Unresolved Issue:
  *
- *		Adding the special operattors adds a new complication.
+ *		Adding the special operators adds a new complication.
  *		How do we handle the case where we want those characters in
  *		a filter specification?   For example how do we know if the
  *		last character of /#& means HF gateway or AND the next part
@@ -242,32 +258,32 @@ static void next_token (pfstate_t *pf)
 
 	if (pf->filter_str[pf->nexti] == '\0') {
 	  pf->token_type = TOKEN_EOL;
-	  strcpy (pf->token_str, "end-of-line");
+	  strlcpy (pf->token_str, "end-of-line", sizeof(pf->token_str));
 	}
 	else if (pf->filter_str[pf->nexti] == '&') {
 	  pf->nexti++;
 	  pf->token_type = TOKEN_AND;
-	  strcpy (pf->token_str, "\"&\"");
+	  strlcpy (pf->token_str, "\"&\"", sizeof(pf->token_str));
 	}
 	else if (pf->filter_str[pf->nexti] == '|') {
 	  pf->nexti++;
 	  pf->token_type = TOKEN_OR;
-	  strcpy (pf->token_str, "\"|\"");
+	  strlcpy (pf->token_str, "\"|\"", sizeof(pf->token_str));
 	}
 	else if (pf->filter_str[pf->nexti] == '!') {
 	  pf->nexti++;
 	  pf->token_type = TOKEN_NOT;
-	  strcpy (pf->token_str, "\"!\"");
+	  strlcpy (pf->token_str, "\"!\"", sizeof(pf->token_str));
 	}
 	else if (pf->filter_str[pf->nexti] == '(') {
 	  pf->nexti++;
 	  pf->token_type = TOKEN_LPAREN;
-	  strcpy (pf->token_str, "\"(\"");
+	  strlcpy (pf->token_str, "\"(\"", sizeof(pf->token_str));
 	}
 	else if (pf->filter_str[pf->nexti] == ')') {
 	  pf->nexti++;
 	  pf->token_type = TOKEN_RPAREN;
-	  strcpy (pf->token_str, "\")\"");
+	  strlcpy (pf->token_str, "\")\"", sizeof(pf->token_str));
 	}
 	else {
 	  char *p = pf->token_str;
@@ -433,10 +449,24 @@ static int parse_filter_spec (pfstate_t *pf)
 	}
 	else if (pf->token_str[0] == 'd' && ispunct(pf->token_str[1])) {
 	  int n;
-	  // loop on used digipeaters
+	  // loop on all digipeaters
 	  result = 0;
 	  for (n = AX25_REPEATER_1; result == 0 && n < ax25_get_num_addr (pf->pp); n++) {
+	    // Consider only those with the H (has-been-used) bit set.
 	    if (ax25_get_h (pf->pp, n)) {
+	      ax25_get_addr_with_ssid (pf->pp, n, addr);
+	      result = filt_bodgu (pf, addr);
+	    }
+	  }
+	}
+	else if (pf->token_str[0] == 'v' && ispunct(pf->token_str[1])) {
+	  int n;
+	  // loop on all digipeaters (mnemonic Via)
+	  result = 0;
+	  for (n = AX25_REPEATER_1; result == 0 && n < ax25_get_num_addr (pf->pp); n++) {
+	    // This is different than the previous "d" filter.
+	    // Consider only those where the the H (has-been-used) bit is NOT set.
+	    if ( ! ax25_get_h (pf->pp, n)) {
 	      ax25_get_addr_with_ssid (pf->pp, n, addr);
 	      result = filt_bodgu (pf, addr);
 	    }
@@ -488,7 +518,7 @@ static int parse_filter_spec (pfstate_t *pf)
 
 	else  {
 	  char stemp[80];
-	  sprintf (stemp, "Unrecognized filter type '%c'", pf->token_str[0]);
+	  snprintf (stemp, sizeof(stemp), "Unrecognized filter type '%c'", pf->token_str[0]);
 	  print_error (pf, stemp);
 	  result = -1;
 	}
@@ -512,7 +542,8 @@ static int parse_filter_spec (pfstate_t *pf)
  * 				Object		o/obj1/obj2...  
  * 				Digipeater	d/digi1/digi2...  
  * 				Group Msg	g/call1/call2...  
- * 				Unproto		u/unproto1/unproto2...  
+ * 				Unproto		u/unproto1/unproto2...
+ *				Via-not-yet	v/digi1/digi2...
  *
  *		arg	- Value to match from source addr, destination,
  *			  used digipeater, object name, etc.
@@ -535,7 +566,7 @@ static int filt_bodgu (pfstate_t *pf, char *arg)
 	char *v;
 	int result = 0;
 
-	strcpy (str, pf->token_str);
+	strlcpy (str, pf->token_str, sizeof(str));
 	sep[0] = str[1];
 	sep[1] = '\0';
 	cp = str + 2;
@@ -588,14 +619,32 @@ static int filt_bodgu (pfstate_t *pf, char *arg)
  *		
  *------------------------------------------------------------------------------*/
 
+/* Telemetry metadata is a special case of message. */
+/* We want to categorize it as telemetry rather than message. */
+
+static int is_telem_metadata (char *infop)
+{
+	if (*infop != ':') return (0);
+	if (strlen(infop) < 16) return (0);
+	if (strncmp(infop+10, ":PARM.", 6) == 0) return (1);
+	if (strncmp(infop+10, ":UNIT.", 6) == 0) return (1);
+	if (strncmp(infop+10, ":EQNS.", 6) == 0) return (1);
+	if (strncmp(infop+10, ":BITS.", 6) == 0) return (1);
+	return (0);
+}
+
+
 static int filt_t (pfstate_t *pf) 
 {
-	char src[MAX_TOKEN_LEN];
-	char *infop;
+	char src[AX25_MAX_ADDR_LEN];
+	char *infop = NULL;
 	char *f;
 
+	memset (src, 0, sizeof(src));
 	ax25_get_addr_with_ssid (pf->pp, AX25_SOURCE, src);
 	(void) ax25_get_info (pf->pp, (unsigned char **)(&infop));
+
+	assert (infop != NULL);
 
 	for (f = pf->token_str + 2; *f != '\0'; f++) {
 	  switch (*f) {
@@ -618,7 +667,7 @@ static int filt_t (pfstate_t *pf)
 	      break;
 
 	    case 'm':				/* Message */
-	      if (*infop == ':') return (1);
+	      if (*infop == ':' && ! is_telem_metadata(infop)) return (1);
 	      break;
 
 	    case 'q':				/* Query */
@@ -631,6 +680,7 @@ static int filt_t (pfstate_t *pf)
 
 	    case 't':				/* Telemetry */
 	      if (*infop == 'T') return (1);
+	      if (is_telem_metadata(infop)) return (1);
 	      break;
 
 	    case 'u':				/* User-defined */
@@ -678,6 +728,12 @@ static int filt_t (pfstate_t *pf)
 		  infop[2] == src[1] &&
 		  infop[3] == src[2]) return (1);
 	      break;
+
+	    default:
+
+	      print_error (pf, "Invalid letter in t/ filter.\n");
+	      return (-1);
+	      break;
 	  }
 	}
 	return (0);			/* Didn't match anything.  Reject */
@@ -690,7 +746,7 @@ static int filt_t (pfstate_t *pf)
  *
  * Name:	filt_r
  * 
- * Purpose:	Is it in range of given location.
+ * Purpose:	Is it in range (kilometers) of given location.
  *
  * Inputs:	pf	- Pointer to current state information.	
  *			  token_str should contain something of format:
@@ -718,7 +774,7 @@ static int filt_r (pfstate_t *pf)
 	double dlat, dlon, ddist, km;
 
 
-	strcpy (str, pf->token_str);
+	strlcpy (str, pf->token_str, sizeof(str));
 	sep[0] = str[1];
 	sep[1] = '\0';
 	cp = str + 2;
@@ -781,9 +837,9 @@ static int filt_r (pfstate_t *pf)
  *
  * Description:	
  *		  
- *		“pri” is zero or more symbols from the primary symbol set.
- *		“alt” is one or more symbols from the alternate symbol set.
- *		“over” is overlay characters.  Overlays apply only to the alternate symbol set.
+ *		"pri" is zero or more symbols from the primary symbol set.
+ *		"alt" is one or more symbols from the alternate symbol set.
+ *		"over" is overlay characters.  Overlays apply only to the alternate symbol set.
  *		
  *		Examples:
  *			s/->		Allow house and car from primary symbol table.
@@ -801,7 +857,7 @@ static int filt_s (pfstate_t *pf)
 	char *pri, *alt, *over;
 
 
-	strcpy (str, pf->token_str);
+	strlcpy (str, pf->token_str, sizeof(str));
 	sep[0] = str[1];
 	sep[1] = '\0';
 	cp = str + 2;
@@ -869,19 +925,19 @@ static void print_error (pfstate_t *pf, char *msg)
 	if (pf->from_chan == MAX_CHANS) {
 
 	  if (pf->to_chan == MAX_CHANS) {
-	    sprintf (intro, "filter[IG,IG]: ");
+	    snprintf (intro, sizeof(intro), "filter[IG,IG]: ");
 	  }
 	  else {
-	    sprintf (intro, "filter[IG,%d]: ", pf->to_chan);
+	    snprintf (intro, sizeof(intro), "filter[IG,%d]: ", pf->to_chan);
 	  }
 	}
 	else {
 
 	  if (pf->to_chan == MAX_CHANS) {
-	    sprintf (intro, "filter[%d,IG]: ", pf->from_chan);
+	    snprintf (intro, sizeof(intro), "filter[%d,IG]: ", pf->from_chan);
 	  }
 	  else {
-	    sprintf (intro, "filter[%d,%d]: ", pf->from_chan, pf->to_chan);
+	    snprintf (intro, sizeof(intro), "filter[%d,%d]: ", pf->from_chan, pf->to_chan);
 	  }
 	}
 
@@ -894,7 +950,7 @@ static void print_error (pfstate_t *pf, char *msg)
 
 
 
-#if TEST
+#if PFTEST
 
 
 /*-------------------------------------------------------------------
@@ -903,7 +959,7 @@ static void print_error (pfstate_t *pf, char *msg)
  *    
  * Purpose:     Unit test for packet filtering.
  *
- * Usage:	gcc -Wall -o pftest -DTEST pfilter.c ax25_pad.o textcolor.o fcs_calc.o decode_aprs.o latlong.o symbols.o telemetry.o misc.a regex.a && ./pftest
+ * Usage:	gcc -Wall -o pftest -DPFTEST pfilter.c ax25_pad.o textcolor.o fcs_calc.o decode_aprs.o latlong.o symbols.o telemetry.o tt_text.c misc.a regex.a && ./pftest
  *		
  *
  *--------------------------------------------------------------------*/
@@ -914,6 +970,9 @@ static void pftest (int test_num, char *filter, char *packet, int expected);
 
 int main ()
 {
+
+	dw_printf ("Quick test for packet filtering.\n");
+	dw_printf ("Some error messages are normal.  Look at the final success/fail message.\n");
 
 	pftest (1, "", "WB2OSZ-5>APDW12,WIDE1-1,WIDE2-1:!4237.14NS07120.83W#PHG7140Chelmsford MA", 0);
 	pftest (2, "0", "WB2OSZ-5>APDW12,WIDE1-1,WIDE2-1:!4237.14NS07120.83W#PHG7140Chelmsford MA", 0);
@@ -990,13 +1049,19 @@ int main ()
 	pftest (112, "t/t", "WM1X>APU25N:@210147z4235.39N/07106.58W_359/000g000t027r000P000p000h89b10234/WX REPORT {UIV32N}<0x0d>", 0);
 	pftest (113, "t/w", "WM1X>APU25N:@210147z4235.39N/07106.58W_359/000g000t027r000P000p000h89b10234/WX REPORT {UIV32N}<0x0d>", 1);
 
+	/* Telemetry metadata is a special case of message. */
+	pftest (114, "t/t", "KJ4SNT>APMI04::KJ4SNT   :PARM.Vin,Rx1h,Dg1h,Eff1h,Rx10m,O1,O2,O3,O4,I1,I2,I3,I4", 1);
+	pftest (115, "t/m", "KJ4SNT>APMI04::KJ4SNT   :PARM.Vin,Rx1h,Dg1h,Eff1h,Rx10m,O1,O2,O3,O4,I1,I2,I3,I4", 0);
+	pftest (116, "t/t", "KB1GKN-10>APRX27,UNCAN,WIDE1*:T#491,4.9,0.3,25.0,0.0,1.0,00000000", 1);
+
+
 	pftest (120, "t/p", "CWAPID>APRS::NWS-TTTTT:DDHHMMz,ADVISETYPE,zcs{seq#", 0);
 	pftest (122, "t/p", "CWAPID>APRS::SKYCWA   :DDHHMMz,ADVISETYPE,zcs{seq#", 0);
 	pftest (123, "t/p", "CWAPID>APRS:;CWAttttz *DDHHMMzLATLONICONADVISETYPE{seq#", 0);
 	pftest (124, "t/n", "CWAPID>APRS::NWS-TTTTT:DDHHMMz,ADVISETYPE,zcs{seq#", 1);
 	pftest (125, "t/n", "CWAPID>APRS::SKYCWA   :DDHHMMz,ADVISETYPE,zcs{seq#", 1);
 	pftest (126, "t/n", "CWAPID>APRS:;CWAttttz *DDHHMMzLATLONICONADVISETYPE{seq#", 1);
-	pftest (127, "t/", "CWAPID>APRS:;CWAttttz *DDHHMMzLATLONICONADVISETYPE{seq#", 0);
+	pftest (127, "t/",  "CWAPID>APRS:;CWAttttz *DDHHMMzLATLONICONADVISETYPE{seq#", 0);
 
 	pftest (130, "r/42.6/-71.3/10", "WB2OSZ-5>APDW12,WIDE1-1,WIDE2-1:!4237.14NS07120.83W#PHG7140Chelmsford MA", 1);
 	pftest (131, "r/42.6/-71.3/10", "WA1PLE-5>APWW10,W1MHL,N8VIM,WIDE2*:@022301h4208.75N/07115.16WoAPRS-IS for Win32", 0);
@@ -1020,6 +1085,13 @@ int main ()
 	pftest (161, "s//#/LS1", "WB2OSZ-5>APDW12:!4237.14N\\07120.83W#PHG7140Chelmsford MA", 0);
 	pftest (162, "s//#/LS1", "WB2OSZ-5>APDW12:!4237.14N/07120.83W#PHG7140Chelmsford MA", 0);
 
+	pftest (170, "v/DIGI2/DIGI3", "WB2OSZ-5>APDW12,DIGI1,DIGI2,DIGI3,DIGI4:!4237.14NS07120.83W#PHG7140Chelmsford MA", 1);
+	pftest (171, "v/DIGI2/DIGI3", "WB2OSZ-5>APDW12,DIGI1*,DIGI2,DIGI3,DIGI4:!4237.14NS07120.83W#PHG7140Chelmsford MA", 1);
+	pftest (172, "v/DIGI2/DIGI3", "WB2OSZ-5>APDW12,DIGI1,DIGI2*,DIGI3,DIGI4:!4237.14NS07120.83W#PHG7140Chelmsford MA", 1);
+	pftest (173, "v/DIGI2/DIGI3", "WB2OSZ-5>APDW12,DIGI1,DIGI2,DIGI3*,DIGI4:!4237.14NS07120.83W#PHG7140Chelmsford MA", 0);
+	pftest (174, "v/DIGI2/DIGI3", "WB2OSZ-5>APDW12,DIGI1,DIGI2,DIGI3,DIGI4*:!4237.14NS07120.83W#PHG7140Chelmsford MA", 0);
+	pftest (175, "v/DIGI9/DIGI2", "WB2OSZ-5>APDW12,DIGI1,DIGI2*,DIGI3,DIGI4:!4237.14NS07120.83W#PHG7140Chelmsford MA", 0);
+
 	/* Test error reporting. */
 
 	pftest (200, "x/", "CWAPID>APRS:;CWAttttz *DDHHMMzLATLONICONADVISETYPE{seq#", -1);
@@ -1032,12 +1104,12 @@ int main ()
 
 	if (error_count > 0) {
 	  text_color_set (DW_COLOR_ERROR);
-	  dw_printf ("Packet Filtering Test - FAILED!\n");
-	  exit (1);
+	  dw_printf ("\nPacket Filtering Test - FAILED!\n");
+	  exit (EXIT_FAILURE);
 	}
-	text_color_set (DW_COLOR_DEBUG );
-	dw_printf ("Packet Filtering Test - SUCCESS!\n");
-	exit (0);
+	text_color_set (DW_COLOR_REC);
+	dw_printf ("\nPacket Filtering Test - SUCCESS!\n");
+	exit (EXIT_SUCCESS);
 
 }
 
